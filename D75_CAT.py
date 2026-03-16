@@ -352,6 +352,8 @@ class D75Serial:
     async def connect(self, port, baudrate=9600):
         """Open serial connection to the radio."""
         try:
+            # Bluetooth RFCOMM doesn't support hardware flow control
+            use_rtscts = not port.startswith('/dev/rfcomm')
             self.transport, self.protocol = await serial_asyncio.create_serial_connection(
                 asyncio.get_event_loop(),
                 lambda: _SerialProtocol(self),
@@ -360,11 +362,13 @@ class D75Serial:
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
-                rtscts=True,  # Hardware flow control
+                rtscts=use_rtscts,
             )
             self._connected = True
-            self.transport.serial.dtr = True
-            print(f"[Serial] Connected to {port} @ {baudrate} (8N1, RTS/CTS)")
+            if use_rtscts:
+                self.transport.serial.dtr = True
+            fc = "RTS/CTS" if use_rtscts else "none (RFCOMM)"
+            print(f"[Serial] Connected to {port} @ {baudrate} (8N1, flow={fc})")
 
             # Start command writer task
             self._write_task = asyncio.create_task(self._command_writer())

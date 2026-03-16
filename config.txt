@@ -1,0 +1,5 @@
+baud_rate=9600
+device=/dev/rfcomm0
+host=0.0.0.0
+port=9750
+password=
