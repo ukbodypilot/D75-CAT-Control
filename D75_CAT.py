@@ -803,7 +803,8 @@ class AudioManager:
         self._read_thread = None
         self._capture_buf = bytearray()
         self._buf_lock = threading.Lock()
-        self._audio_clients = []  # list of asyncio StreamWriters for audio streaming
+        self._audio_clients = []  # list of raw sockets for audio streaming
+        self._clients_lock = threading.Lock()
         self._loop = None  # asyncio event loop for scheduling from threads
         self._connected = False
         self._frame_count = 0
@@ -940,12 +941,13 @@ class AudioManager:
             self._rfcomm = None
 
         # Close audio streaming clients
-        for writer in list(self._audio_clients):
-            try:
-                writer.close()
-            except Exception:
-                pass
-        self._audio_clients.clear()
+        with self._clients_lock:
+            for sock in list(self._audio_clients):
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            self._audio_clients.clear()
 
         print("[Audio] Disconnected")
 
@@ -969,10 +971,9 @@ class AudioManager:
                         self._capture_buf = self._capture_buf[-500_000:]
                     self._capture_buf.extend(data)
 
-                # Forward to streaming clients
-                if self._audio_clients and self._loop:
-                    self._loop.call_soon_threadsafe(
-                        self._forward_audio, bytes(data))
+                # Forward to streaming clients (raw sockets, thread-safe)
+                if self._audio_clients:
+                    self._forward_audio(bytes(data))
 
             except socket.timeout:
                 continue
@@ -1009,12 +1010,20 @@ class AudioManager:
             print(f"[Audio] Async read loop ended ({self._frame_count} frames)")
 
     def _forward_audio(self, data):
-        """Forward audio data to all streaming TCP clients (called from event loop)."""
-        for writer in list(self._audio_clients):
-            try:
-                writer.write(data)
-            except Exception:
-                self._audio_clients.remove(writer)
+        """Forward audio data to all streaming TCP clients via raw sockets."""
+        with self._clients_lock:
+            dead = []
+            for sock in self._audio_clients:
+                try:
+                    sock.sendall(data)
+                except Exception:
+                    dead.append(sock)
+            for sock in dead:
+                self._audio_clients.remove(sock)
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     def read_audio(self, nbytes=0):
         """Read buffered audio data. Returns bytes."""
@@ -1032,15 +1041,18 @@ class AudioManager:
         with self._buf_lock:
             self._capture_buf.clear()
 
-    def add_stream_client(self, writer):
-        """Add a TCP writer to receive raw audio stream."""
-        if writer not in self._audio_clients:
-            self._audio_clients.append(writer)
+    def add_stream_client(self, sock):
+        """Add a raw socket to receive audio stream."""
+        with self._clients_lock:
+            if sock not in self._audio_clients:
+                self._audio_clients.append(sock)
+                print(f"[Audio] Stream client added (total: {len(self._audio_clients)})")
 
-    def remove_stream_client(self, writer):
-        """Remove a TCP writer from audio stream."""
-        if writer in self._audio_clients:
-            self._audio_clients.remove(writer)
+    def remove_stream_client(self, sock):
+        """Remove a raw socket from audio stream."""
+        with self._clients_lock:
+            if sock in self._audio_clients:
+                self._audio_clients.remove(sock)
 
     async def write_audio(self, data):
         """Send audio data to the radio via SCO (for TX)."""
@@ -1091,48 +1103,51 @@ class AudioTCPServer:
 
     Clients connect and receive a continuous stream of raw PCM audio
     (8kHz, 16-bit signed LE, mono). No protocol framing — just raw bytes.
-    This allows direct piping to aplay, ffmpeg, Mumble, etc.
+    Uses raw sockets (not asyncio writers) so the SCO read thread can
+    write directly without event loop scheduling issues.
     """
 
     def __init__(self, audio_mgr, verbose=False):
         self.audio = audio_mgr
         self.verbose = verbose
-        self.server = None
+        self._listen_sock = None
+        self._accept_thread = None
+        self._running = False
 
     async def start(self, host='0.0.0.0', port=9751):
-        self.server = await asyncio.start_server(
-            self._handle_client, host, port,
-            reuse_address=True)
-        addr = self.server.sockets[0].getsockname()
-        print(f"[AudioTCP] Streaming server on {addr[0]}:{addr[1]}")
+        """Start the raw socket listener in a thread."""
+        self._listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listen_sock.settimeout(1.0)
+        self._listen_sock.bind((host, port))
+        self._listen_sock.listen(5)
+        self._running = True
+        self._accept_thread = threading.Thread(
+            target=self._accept_loop, daemon=True, name="AudioTCP-accept")
+        self._accept_thread.start()
+        print(f"[AudioTCP] Streaming server on {host}:{port}")
 
-    async def _handle_client(self, reader, writer):
-        addr = writer.get_extra_info('peername')
-        print(f"[AudioTCP] Client connected: {addr}")
-
-        if not self.audio.connected:
-            writer.write(b"ERROR: audio not connected\n")
-            await writer.drain()
-            writer.close()
-            return
-
-        self.audio.add_stream_client(writer)
-        try:
-            # Keep connection alive until client disconnects
-            while True:
-                data = await reader.read(1024)
-                if not data:
-                    break
-        except (asyncio.CancelledError, ConnectionResetError):
-            pass
-        finally:
-            self.audio.remove_stream_client(writer)
-            print(f"[AudioTCP] Client disconnected: {addr}")
+    def _accept_loop(self):
+        """Accept clients and register their raw sockets with AudioManager."""
+        while self._running:
             try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+                conn, addr = self._listen_sock.accept()
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                print(f"[AudioTCP] Client connected: {addr}")
+                if not self.audio.connected:
+                    try:
+                        conn.sendall(b"ERROR: audio not connected\n")
+                    except Exception:
+                        pass
+                    conn.close()
+                    continue
+                self.audio.add_stream_client(conn)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self._running:
+                    print(f"[AudioTCP] Accept error: {e}")
+                break
 
 
 # ============================================================================
@@ -1456,11 +1471,20 @@ class TCPServer:
                 # Add this TCP client to raw audio stream
                 if not self.audio.connected:
                     return 'audio not connected'
-                self.audio.add_stream_client(writer)
-                return 'streaming started (raw PCM: 8kHz/16-bit/mono)'
+                # Get underlying socket from asyncio writer
+                transport = writer.transport
+                raw_sock = transport.get_extra_info('socket')
+                if raw_sock:
+                    import os
+                    dup_fd = os.dup(raw_sock.fileno())
+                    stream_sock = socket.socket(fileno=dup_fd)
+                    stream_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    self.audio.add_stream_client(stream_sock)
+                    return 'streaming started (raw PCM: 8kHz/16-bit/mono)'
+                return 'could not get underlying socket'
             elif action == 'stop':
-                self.audio.remove_stream_client(writer)
-                return 'streaming stopped'
+                # Note: stop won't work perfectly with duped sockets
+                return 'use TCP disconnect to stop streaming'
             else:
                 return 'usage: !audio connect|disconnect|status|flush|stream|stop'
 
