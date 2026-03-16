@@ -952,9 +952,18 @@ class AudioManager:
         print("[Audio] Disconnected")
 
     def _read_loop(self):
-        """Continuously read SCO audio frames (runs in thread)."""
+        """Continuously read SCO audio frames (runs in thread).
+
+        Filters out 'stuck' frames where the BT controller repeats the last
+        sample for all 24 positions (indicates a dropped SCO packet). These
+        frames are replaced with interpolated data from surrounding frames
+        to produce clean audio.
+        """
         if self.verbose:
             print("[Audio] Read loop started")
+
+        import struct as _struct
+        _prev_frame = None  # Last good frame for interpolation
 
         while self._running and self._sco:
             try:
@@ -963,6 +972,24 @@ class AudioManager:
                     break
 
                 self._frame_count += 1
+
+                # Detect stuck frames: all samples identical (dropped SCO packet)
+                if len(data) == 48:
+                    samples = _struct.unpack('<24h', data)
+                    if len(set(samples)) <= 2:
+                        # Stuck frame — use last good frame faded toward zero,
+                        # or silence if no previous frame
+                        if _prev_frame is not None:
+                            # Fade previous frame by 50% toward zero
+                            prev_samples = _struct.unpack('<24h', _prev_frame)
+                            faded = _struct.pack('<24h', *(s // 2 for s in prev_samples))
+                            data = faded
+                            _prev_frame = faded
+                        else:
+                            data = b'\x00' * 48
+                        # Don't update _prev_frame with stuck data
+                    else:
+                        _prev_frame = data
 
                 # Buffer for polling reads
                 with self._buf_lock:
