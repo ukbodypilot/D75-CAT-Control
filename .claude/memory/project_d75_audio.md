@@ -7,44 +7,31 @@ type: project
 CAT control works on RFCOMM ch2 (/dev/rfcomm0). Audio works via HSP on RFCOMM ch1 + SCO.
 Both run simultaneously over Bluetooth — no drop/reconnect needed.
 
-D75 Bluetooth channels:
-- RFCOMM ch1: Headset AG (HSP, UUID 0x1112) — send AT+CKPD=200 to activate audio routing
-- RFCOMM ch2: Serial Port Profile (SPP, UUID 0x1101) — standard Kenwood CAT at 9600/8N1
-- SCO: Outbound connect, CVSD decoded by BT controller → 8kHz 16-bit signed LE mono, 48-byte frames
-
 D75 BT MAC: 90:CE:B8:D6:55:0A
-Pi BT adapter: 9C:AD:EF:FE:13:BF (hci0) — CSR (Cambridge Silicon Radio) USB, vendor 6242:8202, HCI 2.1
+Pi BT adapter: 9C:AD:EF:FE:13:BF (hci0) — CSR (Cambridge Silicon Radio) USB, vendor 6242:8202
 
-**Adapter history:** RTL8761BU (00:E0:4C:23:99:87) has fatal SCO firmware bug — "unknown connection handle" on every SCO session, all 0xFF audio. Not fixable via force_scofix, alt settings, or module reload. Switched to CSR adapter on 2026-03-16 which works perfectly.
-
-Key findings (2026-03-16):
-- Do NOT send HFP AT commands (BRSF, CIND, CMER) — D75 returns ERROR and destabilizes link
-- AT+CKPD=200 is the only recognized command (HSP button press, returns OK)
-- SCO must be outbound connect (not listen) — AG-initiated SCO only survives 1 frame
-- Audio verified: peak 1,036, RMS 38.0 with open squelch (CSR adapter)
-- Simultaneous CAT+Audio confirmed working — freq changes, squelch, ID all work during audio
-- RFCOMM ch1 must stay open during audio (closing it drops SCO)
+**Adapter history:** RTL8761BU has fatal SCO firmware bug. CSR adapter works but has ~48% SCO frame loss (stuck frames). Fixed with stuck frame filter in _read_loop.
 
 **Correct BT startup sequence (implemented as !btstart):**
 1. Connect audio: RFCOMM ch1 → SCO → AT+CKPD=200 (must be FIRST — rfcomm bind blocks ch1)
 2. Bind rfcomm0 (sudo rfcomm bind 0 addr 2) — after audio is established
 3. Open serial on /dev/rfcomm0 via pyserial
 
-**Critical ordering rules:**
-- Audio (RFCOMM ch1 + SCO + CKPD) MUST connect BEFORE rfcomm bind to ch2
-- rfcomm bind to ch2 blocks the D75 from accepting new RFCOMM ch1 connections
-- CKPD must be sent AFTER SCO connects but BEFORE serial opens
+**Audio TCP streaming:** Raw socket forwarding (not asyncio). AudioTCPServer uses threading accept loop, _forward_audio uses sock.sendall() from SCO read thread. Port 9751.
 
-**Current status (2026-03-16, fully working):**
-- !btstart end-to-end verified: audio+CKPD → rfcomm bind → serial all succeed
-- TCP CAT control working (port 9750, !command protocol, auth via !pass)
-- AudioManager + AudioTCPServer (port 9751) streams raw PCM to clients
-- bt_full_test.py passes: CAT + Audio simultaneous, peak=1036
-- CSR adapter confirmed reliable for SCO
+**SCO stuck frame filter:** CSR adapter repeats last sample for all 24 positions in dropped packets. _read_loop detects stuck frames (unique values <= 2) and replaces with faded copy of last good frame. Reduces stuck rate from 48% to ~4%.
 
-**Next steps:**
-1. Build D75 CAT client for radio-gateway integration
-2. Wire D75 audio into gateway via RemoteAudioSource (8k→48k resample)
+**Gateway integration (2026-03-16, fully working):**
+- D75AudioSource: TCP client to port 9751, 6x linear interpolation (8kHz→48kHz) with boundary continuity (_prev_last), queues for mixer
+- D75CATClient: TCP client to port 9750, text !command protocol, polls !status every 2s, send_command() pauses polling to avoid race condition
+- Config: ENABLE_D75, D75_HOST, D75_PORT, D75_AUDIO_PORT, D75_PASSWORD, D75_AUDIO_BOOST, etc.
+- Web UI: /d75 control page (dual-band freq/squelch/mode/power), /d75status + /d75cmd endpoints
+- Dashboard: D75 orange audio level bar, connection status, mute indicator
+- Nav links conditional on ENABLE flags (ENABLE_TH9800, ENABLE_D75)
+- Keyboard 'w' mutes D75 audio
+- Systemd service manages gateway (don't start manually or you get duplicates!)
 
-**Why:** Remote audio streaming through headless TCP server for radio-gateway integration.
-**How to apply:** Use !btstart for proper startup. Test scripts: bt_audio_test.py, bt_dual_test.py, bt_full_test.py.
+**D75 BT quirk:** D75 goes unresponsive after rapid connect/disconnect cycles. Must toggle BT off/on on radio to recover. Avoid killing D75 server unnecessarily.
+
+**Why:** Remote audio streaming + CAT control through headless TCP server for radio-gateway integration.
+**How to apply:** Use systemd to manage gateway. D75_CAT.py runs separately. !btstart handles full connection sequence.

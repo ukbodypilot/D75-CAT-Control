@@ -278,6 +278,21 @@ response = cat.read(cat.in_waiting or 1)
   update, and Pi reboot all fail to permanently fix it
 - **Solution:** Replace with a CSR or Broadcom-based USB BT adapter
 
+### Audio sounds like digital garbage (CSR adapter)
+- CSR adapters drop ~48% of SCO packets. The BT controller repeats the
+  last decoded sample for all 24 positions in a dropped frame ("stuck frame").
+- D75_CAT.py includes a stuck frame filter in `_read_loop()` that detects
+  frames where all samples are identical and replaces them with faded copies
+  of the last good frame.
+- This reduces stuck frames from ~48% to ~4% and produces intelligible audio.
+- The filter runs automatically — no configuration needed.
+
+### Audio TCP streaming not working
+- The AudioTCPServer uses raw socket forwarding (not asyncio StreamWriter).
+  `_forward_audio()` calls `sock.sendall()` directly from the SCO read thread.
+- If the audio TCP server connects but no data flows, check that `!btstart`
+  succeeded and `!audio status` shows `connected: true`.
+
 ### D75 not responding after rapid connect/disconnect
 - The D75 can become temporarily unresponsive after multiple BT disconnects
 - Toggle Bluetooth off/on on the D75 (Menu → Bluetooth → Off, wait, On)
