@@ -1,141 +1,157 @@
-# D74/75 CAT Control Software
+# D75 CAT Control — Headless TCP Server
 
-<p align="center">
-<img src="./icon.png" />
-</p>
+Headless TCP server for remote control of the Kenwood TH-D75 (and TH-D74) via CAT commands, with Bluetooth SCO audio streaming. Designed to run on a Raspberry Pi as a systemd service and integrate with [radio-gateway](https://github.com/ukbodypilot/radio-gateway).
 
-This software is for controlling the Kenwood D74/75 via CAT commands from your PC, Mac, or Linux computer.
+Forked from [xbenkozx/D75-CAT-Control](https://github.com/xbenkozx/D75-CAT-Control) (GUI version). This fork replaces the Qt GUI with an asyncio TCP server and adds Bluetooth audio support.
 
-## How to use
-You can connect to your radio either via USB or through Bluetooth. If you plan on using the internal KISS TNC, make sure to set your Interface opposite of your CAT connection. For example, if you are using USB for CAT control, set your KISS interface to Bluetooth, otherwise CAT Control will disconnect from the radio.
+## Features
 
-The KISS interface can be changed via Menu [983].
+- TCP server for remote CAT control (port 9750)
+- Bluetooth HSP/SCO audio streaming (port 9751) — 8kHz 16-bit mono PCM
+- Simultaneous CAT + audio over Bluetooth
+- Systemd service for headless operation
+- No GUI or PySide6 dependency
 
-## Memory Channels
-Memory channels are defaulted in the CAT control software to just the numbers. If you would like add names to your channels, use the additional <i>mnd.py</i> file with the 
-argument -p [COMPORT]. This will dump your memory channel names to <i>channel_memory.json</i> and will load next time you start the CAT Control software.
+## Hardware Requirements
 
-The file can be located in the D75 CAT Control folder in your HOME directory.
+- Kenwood TH-D75 (or TH-D74)
+- Raspberry Pi (tested on Pi with Linux 6.12, ARM64)
+- **USB Bluetooth adapter: CSR (Cambridge Silicon Radio) or Broadcom (e.g., ASUS USB-BT400)**
 
-You will need to dump the memory channel names if there is any addition, removal, or name change of the channel.
+> **Do NOT use Realtek BT adapters** (RTL8761BU, RTL8851BU, etc.) for audio.
+> They have a fatal SCO firmware bug — invalid connection handles cause silent
+> audio on every session. See [docs/bluetooth_audio.md](docs/bluetooth_audio.md)
+> for details.
 
-<i>Note: The way that the radio reports the current channel over serial, it is not possible to preload both bands current channel. Once you switch bands, it will load the current band into the CAT Control software.</i>
+For USB serial only (no BT audio), any connection method works.
 
-## Config
-Some additional settings can be set in the config.cfg file. The config file can be located in the D75 CAT Control folder in your HOME directory.
-
-| Section | Variable    | Default      | Description |
-|---------|-------------|--------------|-------------|
-| SERIAL  | port        | <i>empty</i> | Defines the serial COM port.<br/>Autosaved based on your previous connection. |
-| SERIAL  | autoconnect | False        | Can be set to <i>True</i> if you wish to attempt a<br/>connection to your last COM port on startup. |
-| GPS     | alt_format  | I            | I = Imperial, M = Metric |
-| GPS     | spd_format  | I            | I = Imperial, M = Metric |
-| DEBUG   | verbose     | False        | Set to True if you want all data sent and received<br/>to print to console. |
-|||||
-
-# Compiling an EXE
-For Windows users, you can compile a single file EXE. You can build it by running the following command from the main project directory. 
-
-    pyinstaller -y d75_cat_control.spec
-
-Once complete, you will find your EXE in the <i>dist</i> folder.
-
-
-## Headless TCP Server (D75_CAT.py)
-
-A standalone headless TCP server for remote CAT control, designed to integrate with
-[radio-gateway](https://github.com/ukbodypilot/radio-gateway). No GUI or PySide6 required.
-
-### Quick Start
+## Quick Start
 
 ```bash
 # Install dependencies
 pip3 install pyserial pyserial-asyncio --break-system-packages
 
-# Start the server
-python3 D75_CAT.py -c /dev/ttyUSB0 --start-server
+# USB serial
+python3 D75_CAT.py -c /dev/ttyUSB0 -d
 
-# Or install as a systemd service
-./install.sh
-# Edit config.txt to set your serial port, then:
-sudo systemctl start d75-cat
+# Bluetooth (edit config.txt first)
+python3 D75_CAT.py -d
 ```
 
-### TCP Protocol
+### Bluetooth Setup
 
-Connect to port 9750 (default). Commands use `!command data\n` format:
+1. Pair the D75 with your CSR adapter via `bluetoothctl`
+2. Edit `config.txt`:
+   ```
+   device=/dev/rfcomm0
+   bt_addr=90:CE:B8:D6:55:0A    # Your D75's BT MAC
+   ```
+3. Start the server: `python3 D75_CAT.py -d`
+4. Connect via TCP and run `!btstart`
 
+`!btstart` handles the full connection sequence: audio (RFCOMM ch1 + SCO + CKPD), rfcomm bind, then serial open.
+
+## TCP Protocol
+
+Connect to port 9750. Commands use `!command [args]\n` format. Authenticate first with `!pass`.
+
+### Connection & Control
+
+| Command | Description |
+|---------|-------------|
+| `!pass <password>` | Authenticate (required first) |
+| `!btstart` | Full BT startup: audio + CAT serial |
+| `!serial connect` | Connect CAT serial only |
+| `!serial disconnect` | Disconnect serial |
+| `!serial status` | Connection status |
+| `!audio connect` | Connect BT audio only |
+| `!audio disconnect` | Disconnect audio |
+| `!audio status` | Audio connection status (JSON) |
+| `!audio stream` | Stream audio to this TCP client |
+| `!exit` | Disconnect |
+
+### Radio Commands
+
+| Command | Description |
+|---------|-------------|
+| `!cat <CMD> [payload]` | Raw CAT command (e.g., `!cat FQ 0`) |
+| `!freq [band] [freq]` | Get/set frequency |
+| `!vol [level]` | Get/set AF gain (0-255) |
+| `!squelch <band> [level]` | Get/set squelch |
+| `!channel <band> [ch]` | Get/set memory channel |
+| `!ptt on\|off` | Transmit/receive |
+| `!meter [band]` | Read S-meter |
+| `!power <band> [level]` | Get/set output power |
+| `!mode <band> [mode]` | Get/set mode |
+| `!band [idx]` | Get/set active band (0=A, 1=B) |
+| `!dual [0\|1]` | Dual/single band |
+| `!gps [on\|off]` | GPS control |
+| `!bt [on\|off]` | Bluetooth control |
+| `!info` | Radio model, S/N, firmware |
+| `!status` | Full radio state (JSON) |
+
+## Audio Streaming
+
+When Bluetooth is configured, audio is available two ways:
+
+1. **TCP port 9751** — Connect and receive raw PCM (8kHz, 16-bit signed LE, mono)
+2. **`!audio stream`** — Stream audio over the CAT TCP connection
+
+Audio format: 8,000 Hz sample rate, 16-bit signed little-endian, mono. 48-byte SCO frames (24 samples each, ~331 frames/sec). CVSD decoding is handled in hardware by the BT controller.
+
+See [docs/bluetooth_audio.md](docs/bluetooth_audio.md) for full technical details including adapter selection, connection sequence, and troubleshooting.
+
+## Configuration
+
+`config.txt` in the project directory:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `baud_rate` | `9600` | Serial baud rate |
+| `device` | *(empty)* | Serial port (e.g., `/dev/ttyUSB0` or `/dev/rfcomm0`) |
+| `host` | `0.0.0.0` | TCP bind address |
+| `port` | `9750` | CAT TCP port |
+| `password` | *(empty)* | TCP auth password (blank = still requires `!pass`) |
+| `bt_addr` | *(empty)* | D75 Bluetooth MAC (enables audio features) |
+| `audio_port` | `9751` | Audio streaming TCP port |
+
+## Systemd Service
+
+```bash
+./install.sh                          # Install deps + service
+sudo systemctl enable d75-cat         # Start on boot
+sudo systemctl start d75-cat          # Start now
+sudo systemctl status d75-cat         # Check status
+journalctl -u d75-cat -f              # Follow logs
 ```
-!pass <password>          # Authenticate
-!serial connect           # Connect to radio serial port
-!serial disconnect        # Disconnect serial
-!serial status            # Check serial connection
-!cat <CMD> [payload]      # Send raw CAT command (e.g., !cat FQ 0)
-!freq [band] [freq]       # Get/set frequency (e.g., !freq 0 145.500)
-!vol [level]              # Get/set AF gain (0-255)
-!squelch <band> [level]   # Get/set squelch
-!channel <band> [ch]      # Get/set memory channel
-!ptt on|off               # Transmit/receive (uses TX/RX CAT commands)
-!meter [band]             # Read S-meter
-!power <band> [level]     # Get/set output power
-!mode <band> [mode]       # Get/set band mode
-!band [idx]               # Get/set active band (0=A, 1=B)
-!dual [0|1]               # Dual/single band mode
-!gps [on|off] [pcout]     # GPS control
-!bt [on|off]              # Bluetooth control
-!info                     # Radio model, serial number, firmware
-!dtr [on|off]             # Toggle DTR line
-!status                   # Full radio state (JSON)
-!exit                     # Disconnect
-```
 
-### Configuration (config.txt)
-
-```
-baud_rate=9600
-device=                   # Serial port or device description
-host=0.0.0.0              # TCP bind address
-port=9750                 # TCP port (default 9750, avoids conflict with TH9800 on 9800)
-password=                 # TCP auth password (blank = no password)
-```
-
-### Key Differences from GUI Version
-
-- No PySide6/Qt dependency — pure Python asyncio
-- TCP server for remote control (not just local serial)
-- Runs headless as a systemd service
-- Serial uses hardware flow control (RTS/CTS) — RTS is NOT toggled for PTT
-- PTT uses CAT `TX`/`RX` commands directly
-- Command queuing ensures one-at-a-time serial communication
-
-### Files
+## Project Structure
 
 | File | Description |
 |------|-------------|
-| `D75_CAT.py` | Headless TCP server (main) |
+| `D75_CAT.py` | Headless TCP server — CAT, audio, and BT management |
 | `config.txt` | Server configuration |
-| `run-headless.sh` | Startup script (reads config) |
-| `install.sh` | Installs deps + systemd service |
-| `requirements-headless.txt` | Python dependencies |
+| `run-headless.sh` | Startup script (reads config, finds serial port) |
+| `install.sh` | Installs dependencies + systemd service |
+| `bt_full_test.py` | Integration test — CAT + audio simultaneous |
+| `bt_audio_test.py` | Basic SCO audio capture test |
+| `bt_dual_test.py` | CAT + audio dual test |
+| `docs/bluetooth_audio.md` | Full BT audio technical reference |
+| `d75_cat_control.py` | Original GUI application (upstream, not used) |
+| `CATControlServer.py` | Original GUI server (upstream, not used) |
 
-### Systemd Service
+## Bluetooth Connection Sequence
 
-```bash
-sudo systemctl enable d75-cat    # Start on boot
-sudo systemctl start d75-cat     # Start now
-sudo systemctl status d75-cat    # Check status
-journalctl -u d75-cat -f         # Follow logs
-```
+The `!btstart` command executes this sequence:
 
-## Future Development
-As this program is in beta stage of development, there is always room for improvement.
+1. **Audio first** — RFCOMM ch1 (HSP) + SCO connect + AT+CKPD=200
+2. **Bind rfcomm0** — `rfcomm bind 0 <MAC> 2` for CAT serial
+3. **Open serial** — pyserial on `/dev/rfcomm0` at 9600 baud
 
-If you come across any issues or wish to have features added, please let me know at <a href="mailto:k7dmg@protonmail.com">k7dmg@protonmail.com</a>.
+Order matters: rfcomm bind to ch2 blocks the D75 from accepting ch1, so audio must connect first. CKPD must be sent after SCO but before serial opens.
 
 ## License
 
-D75 CAT Control is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+GNU General Public License v3.0. See [LICENSE](https://www.gnu.org/licenses/gpl-3.0.html).
 
-D75 CAT Control is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with D75 CAT Control. If not, see <https://www.gnu.org/licenses/>.
+Based on [D75-CAT-Control](https://github.com/xbenkozx/D75-CAT-Control) by Ben Kozlowski (K7DMG).
