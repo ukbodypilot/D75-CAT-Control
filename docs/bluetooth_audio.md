@@ -14,6 +14,23 @@ audio on channel 1 + SCO do not interfere with each other.
 
 ## Hardware Setup
 
+### Bluetooth Adapter Selection
+
+**Use a CSR (Cambridge Silicon Radio) USB adapter.** Realtek-based adapters
+(RTL8761BU, RTL8851BU, etc.) have a fatal SCO firmware bug — the firmware
+generates malformed SCO packets with invalid connection handles, causing the
+kernel to log "SCO packet for unknown connection handle" and deliver all-0xFF
+audio frames. This bug triggers on the first SCO connection and is not fixable
+via `force_scofix`, USB alt settings, module reload, or firmware update.
+A Realtek patch was submitted (Dec 2022) but never merged upstream.
+
+**Known working:** CSR-based USB dongles (vendor ID 0x0a12 or similar,
+manufacturer "Cambridge Silicon Radio"). The ASUS USB-BT400 (BCM20702) is
+also reported to work.
+
+**Known broken:** RTL8761BU (0bda:8771), RTL8851BU, and likely all Realtek
+BT USB adapters for SCO audio.
+
 ### Bluetooth Pairing
 
 Pair the D75 via `bluetoothctl` or the desktop Bluetooth GUI:
@@ -85,16 +102,24 @@ monitor.bluez.properties = {
 
 ### Connection Sequence
 
-1. **RFCOMM ch1** — Open a raw Bluetooth RFCOMM socket to the D75's channel 1
-   (Headset AG). This establishes the HSP service-level connection.
+1. **Bind rfcomm0** — `sudo rfcomm bind 0 <MAC> 2` creates the device node
+   and may establish the ACL link.
 
-2. **AT+CKPD=200** — Send this HSP "button press" command over RFCOMM to
-   activate audio routing on the radio. The D75 responds with `OK`.
+2. **RFCOMM ch1** — Open a raw Bluetooth RFCOMM socket to the D75's channel 1
+   (Headset AG). This establishes the HSP service-level connection.
 
 3. **SCO socket** — Open an outbound SCO (Synchronous Connection-Oriented)
    socket to the D75. This creates the audio transport.
 
-4. **Audio flows** — The BT controller decodes CVSD in hardware and delivers
+4. **AT+CKPD=200** — Send this HSP "button press" command over RFCOMM to
+   activate audio routing on the radio. The D75 responds with `OK`.
+   **Critical: CKPD must be sent AFTER SCO connects but BEFORE CAT serial opens.**
+   Sending CKPD while CAT serial is active on rfcomm0 causes cross-channel
+   errors that break SCO.
+
+5. **Open CAT serial** — Open `/dev/rfcomm0` via pyserial.
+
+6. **Audio flows** — The BT controller decodes CVSD in hardware and delivers
    8kHz 16-bit signed little-endian mono PCM via the SCO socket.
 
 ### Important Notes
@@ -121,9 +146,9 @@ monitor.bluez.properties = {
 
 ### Audio Quality
 
-With squelch open on an active channel:
-- Peak amplitude: ~16,000 (out of 32,767)
-- RMS: ~4,000
+With squelch open on an active channel (CSR adapter):
+- Peak amplitude: ~1,000–16,000 (out of 32,767), depends on signal
+- RMS: ~38–4,000
 - Suitable for voice communications and digital mode decoding
 
 Some zero-filled frames (dropped SCO packets) are normal for Bluetooth audio
@@ -178,16 +203,16 @@ rfcomm = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, BTPROTO_RFCOMM)
 rfcomm.settimeout(5.0)
 rfcomm.connect((D75_ADDR, 1))  # Channel 1 = Headset AG
 
-# 2. Activate audio routing
-rfcomm.send(b"AT+CKPD=200\r")
-time.sleep(0.5)
-rfcomm.recv(1024)  # Read OK response
-
-# 3. SCO for audio
+# 2. SCO for audio (MUST be before CKPD)
 sco = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, BTPROTO_SCO)
 sco.setsockopt(SOL_BLUETOOTH, BT_VOICE, struct.pack("H", BT_VOICE_CVSD_16BIT))
 sco.settimeout(5.0)
 sco.connect(D75_ADDR)
+
+# 3. Activate audio routing (AFTER SCO, BEFORE opening CAT serial)
+rfcomm.send(b"AT+CKPD=200\r")
+time.sleep(0.5)
+rfcomm.recv(1024)  # Read OK response
 
 # 4. Read audio frames (48 bytes = 24 samples of 16-bit PCM)
 while True:
@@ -243,3 +268,15 @@ response = cat.read(cat.in_waiting or 1)
 - The D75 returns ERROR for all HFP AT commands (AT+BRSF, AT+CIND, etc.)
 - Only send AT+CKPD=200 on the HSP channel
 - Multiple ERRORs can destabilize the connection
+
+### Audio is all 0xFF with Realtek adapter
+- This is a known RTL8761BU firmware bug (SCO packets with invalid handles)
+- dmesg will show: `SCO packet for unknown connection handle N`
+- Not fixable: `force_scofix`, USB alt settings, module reload, firmware
+  update, and Pi reboot all fail to permanently fix it
+- **Solution:** Replace with a CSR or Broadcom-based USB BT adapter
+
+### D75 not responding after rapid connect/disconnect
+- The D75 can become temporarily unresponsive after multiple BT disconnects
+- Toggle Bluetooth off/on on the D75 (Menu → Bluetooth → Off, wait, On)
+- Wait 5-10 seconds before reconnecting
