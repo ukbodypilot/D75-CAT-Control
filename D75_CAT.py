@@ -469,13 +469,19 @@ class D75Serial:
             try:
                 data = self._bt_serial.read(self._bt_serial.in_waiting or 1)
                 if data:
-                    # Schedule data processing on the event loop
                     if self._loop:
                         self._loop.call_soon_threadsafe(self._data_received, data)
                     else:
                         self._data_received(data)
+            except OSError as e:
+                if self._connected:
+                    print(f"[Serial] Read error: {e} — link may be dead")
+                break
             except Exception:
                 break
+        if self._connected:
+            # Read loop exited while still supposed to be connected = link failure
+            self._connected = False
 
     async def disconnect(self):
         """Close serial connection."""
@@ -553,12 +559,27 @@ class D75Serial:
         """Track consecutive timeouts and auto-reconnect serial if link is dead."""
         self._consecutive_timeouts += 1
         if self._consecutive_timeouts >= 3 and not self._reconnecting:
-            print(f"[Serial] {self._consecutive_timeouts} consecutive timeouts — reconnecting...")
             self._reconnecting = True
+            _reconnect_attempts = getattr(self, '_reconnect_attempts', 0)
+            if _reconnect_attempts >= 3:
+                print(f"[Serial] Max reconnect attempts reached — giving up (use !serial connect to retry)")
+                self._connected = False
+                self._reconnecting = False
+                return
+            self._reconnect_attempts = _reconnect_attempts + 1
+            print(f"[Serial] {self._consecutive_timeouts} consecutive timeouts — reconnecting (attempt {self._reconnect_attempts}/3)...")
             try:
                 await self.disconnect()
-                await asyncio.sleep(2)
                 bt_addr = self._bt_addr
+                if bt_addr:
+                    # Release and rebind rfcomm to get a fresh link
+                    import subprocess
+                    subprocess.run(['sudo', 'rfcomm', 'release', '0'],
+                                   capture_output=True, timeout=5)
+                    await asyncio.sleep(2)
+                    subprocess.run(['sudo', 'rfcomm', 'bind', '0', bt_addr, '2'],
+                                   capture_output=True, timeout=5)
+                    await asyncio.sleep(1)
                 port = getattr(self, '_comport', '/dev/rfcomm0')
                 baud = getattr(self, '_baudrate', 9600)
                 if bt_addr:
@@ -568,6 +589,7 @@ class D75Serial:
                 if ok:
                     print(f"[Serial] Reconnected successfully")
                     self._consecutive_timeouts = 0
+                    self._reconnect_attempts = 0
                 else:
                     print(f"[Serial] Reconnect failed")
             except Exception as e:
@@ -580,20 +602,33 @@ class D75Serial:
         while True:
             try:
                 data = await self._command_queue.get()
+                if not self._connected:
+                    # Discard commands when disconnected
+                    self._response_event.set()
+                    continue
                 if self.verbose:
                     print(f"[Serial] TX: {data}")
-                if self._bt_serial:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, self._bt_serial.write, data)
-                else:
-                    self.transport.write(data)
+                try:
+                    if self._bt_serial:
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(None, self._bt_serial.write, data)
+                    elif self.transport:
+                        self.transport.write(data)
+                    else:
+                        self._response_event.set()
+                        continue
+                except OSError as e:
+                    print(f"[Serial] Write failed: {e}")
+                    self._connected = False
+                    self._response_event.set()  # Unblock any waiting send_command
+                    continue
                 # Wait for response before sending next command
                 try:
                     await asyncio.wait_for(self._response_event.wait(), timeout=3.0)
                 except asyncio.TimeoutError:
                     if self.verbose:
                         print(f"[Serial] No response for: {data}")
-                await asyncio.sleep(0.05)  # small gap between commands
+                await asyncio.sleep(0.05)
             except asyncio.CancelledError:
                 return
             except Exception as e:

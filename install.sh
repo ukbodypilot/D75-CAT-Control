@@ -56,8 +56,8 @@ User=$CURRENT_USER
 Group=$CURRENT_USER
 WorkingDirectory=$SCRIPT_DIR
 ExecStart=$SCRIPT_DIR/run-headless.sh
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=10
 TimeoutStopSec=15
 KillMode=control-group
 
