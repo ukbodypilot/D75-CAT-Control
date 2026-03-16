@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import signal
+import socket
+import struct
 import sys
 import threading
 import time
@@ -36,7 +38,7 @@ except ImportError:
 # CONSTANTS
 # ============================================================================
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.txt")
 CONFIG_DEFAULTS = {
@@ -45,6 +47,8 @@ CONFIG_DEFAULTS = {
     "host": "0.0.0.0",
     "port": "9750",
     "password": "",
+    "bt_addr": "",
+    "audio_port": "9751",
 }
 
 # Kenwood D74/D75 CAT command codes
@@ -331,7 +335,12 @@ class RadioState:
 # ============================================================================
 
 class D75Serial:
-    """Async serial connection to the D74/D75 radio."""
+    """Async serial connection to the D74/D75 radio.
+
+    Supports two connection modes:
+      - USB: serial_asyncio on /dev/ttyUSB* with RTS/CTS
+      - Bluetooth: raw RFCOMM socket (avoids /dev/rfcomm* which conflicts with SCO audio)
+    """
 
     def __init__(self, verbose=False):
         self.transport = None
@@ -348,11 +357,23 @@ class D75Serial:
         self._read_task = None
         self._tcp_clients = []  # list of (reader, writer) for forwarding
         self._last_radio_rx = 0
+        self._bt_serial = None  # pyserial on /dev/rfcomm0 (Bluetooth mode)
+        self._read_thread = None
+        self._loop = None
 
-    async def connect(self, port, baudrate=9600):
-        """Open serial connection to the radio."""
+    async def connect(self, port, baudrate=9600, bt_addr=None):
+        """Open serial connection to the radio.
+
+        If bt_addr is provided, uses raw RFCOMM socket to channel 2 instead
+        of opening /dev/rfcomm*. This avoids conflicts with SCO audio.
+        """
+        if bt_addr:
+            return await self._connect_bluetooth(bt_addr)
+        return await self._connect_serial(port, baudrate)
+
+    async def _connect_serial(self, port, baudrate):
+        """Connect via USB serial port."""
         try:
-            # Bluetooth RFCOMM doesn't support hardware flow control
             use_rtscts = not port.startswith('/dev/rfcomm')
             self.transport, self.protocol = await serial_asyncio.create_serial_connection(
                 asyncio.get_event_loop(),
@@ -370,22 +391,81 @@ class D75Serial:
             fc = "RTS/CTS" if use_rtscts else "none (RFCOMM)"
             print(f"[Serial] Connected to {port} @ {baudrate} (8N1, flow={fc})")
 
-            # Start command writer task
             self._write_task = asyncio.create_task(self._command_writer())
-
-            # Run init sequence
             await self._init_radio()
             return True
         except Exception as e:
             print(f"[Serial] Connection failed: {e}")
             return False
 
+    async def _connect_bluetooth(self, bt_addr):
+        """Connect via pyserial on /dev/rfcomm0 bound to the BT address.
+
+        Uses synchronous pyserial (not serial_asyncio) to avoid conflicts
+        with SCO audio. Read loop runs in a thread.
+        """
+        loop = asyncio.get_event_loop()
+
+        # Ensure rfcomm0 is bound
+        import subprocess
+        subprocess.run(['sudo', 'rfcomm', 'bind', '0', bt_addr, '2'],
+                       capture_output=True, timeout=5)
+
+        port = '/dev/rfcomm0'
+
+        def _do_connect():
+            import serial as pyserial
+            s = pyserial.Serial(port, 9600, timeout=1,
+                                bytesize=pyserial.EIGHTBITS,
+                                parity=pyserial.PARITY_NONE,
+                                stopbits=pyserial.STOPBITS_ONE,
+                                rtscts=False)
+            return s
+
+        try:
+            self._bt_serial = await loop.run_in_executor(None, _do_connect)
+            self._connected = True
+            self._loop = loop
+            self._bt_addr_used = bt_addr
+            print(f"[Serial] Connected via Bluetooth {port} to {bt_addr} ch2")
+
+            # Read loop in thread, command writer in asyncio
+            self._read_thread = threading.Thread(target=self._bt_serial_read_loop, daemon=True)
+            self._read_thread.start()
+            self._write_task = asyncio.create_task(self._command_writer())
+            await self._init_radio()
+            return True
+        except Exception as e:
+            print(f"[Serial] Bluetooth connection failed: {e}")
+            return False
+
+    def _bt_serial_read_loop(self):
+        """Read from pyserial BT connection in a thread."""
+        while self._connected and self._bt_serial:
+            try:
+                data = self._bt_serial.read(self._bt_serial.in_waiting or 1)
+                if data:
+                    # Schedule data processing on the event loop
+                    if self._loop:
+                        self._loop.call_soon_threadsafe(self._data_received, data)
+                    else:
+                        self._data_received(data)
+            except Exception:
+                break
+
     async def disconnect(self):
         """Close serial connection."""
+        self._connected = False
         if self._write_task:
             self._write_task.cancel()
             self._write_task = None
-        if self.transport and not self.transport.is_closing():
+        if self._bt_serial:
+            self._bt_serial.close()
+            self._bt_serial = None
+            if self._read_thread:
+                self._read_thread.join(timeout=2)
+                self._read_thread = None
+        elif self.transport and not self.transport.is_closing():
             try:
                 self.transport.serial.dtr = False
             except Exception:
@@ -398,6 +478,8 @@ class D75Serial:
 
     @property
     def connected(self):
+        if self._bt_serial:
+            return self._connected and self._bt_serial.is_open
         return self._connected and self.transport and not self.transport.is_closing()
 
     async def send_command(self, cmd, payload=None):
@@ -446,7 +528,11 @@ class D75Serial:
                 data = await self._command_queue.get()
                 if self.verbose:
                     print(f"[Serial] TX: {data}")
-                self.transport.write(data)
+                if self._bt_serial:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, self._bt_serial.write, data)
+                else:
+                    self.transport.write(data)
                 # Wait for response before sending next command
                 try:
                     await asyncio.wait_for(self._response_event.wait(), timeout=3.0)
@@ -667,14 +753,368 @@ class _SerialProtocol(asyncio.Protocol):
             print("[Serial] Connection closed")
 
 # ============================================================================
+# BLUETOOTH AUDIO
+# ============================================================================
+
+# Bluetooth socket constants
+BTPROTO_RFCOMM = 3
+BTPROTO_SCO = 2
+SOL_BLUETOOTH = 274
+BT_VOICE = 11
+BT_VOICE_CVSD_16BIT = 0x0060
+SOL_SCO = 17
+SCO_OPTIONS = 1
+
+AUDIO_SAMPLE_RATE = 8000
+AUDIO_SAMPLE_WIDTH = 2  # 16-bit
+AUDIO_CHANNELS = 1
+AUDIO_FRAME_SIZE = 48  # bytes per SCO frame
+
+
+class AudioManager:
+    """Manages Bluetooth HSP audio connection to the D75.
+
+    The D75 exposes two Bluetooth services:
+      - RFCOMM ch1: Headset Audio Gateway (HSP) — audio control
+      - RFCOMM ch2: Serial Port Profile (SPP) — CAT control (handled by D75Serial)
+
+    Audio flows via SCO (Synchronous Connection-Oriented) link.
+    CVSD decoding is done in hardware by the BT controller.
+    Result: 8kHz, 16-bit signed LE, mono PCM.
+    """
+
+    def __init__(self, bt_addr, verbose=False):
+        self.bt_addr = bt_addr
+        self.verbose = verbose
+        self._rfcomm = None
+        self._sco = None
+        self._running = False
+        self._read_thread = None
+        self._capture_buf = bytearray()
+        self._buf_lock = threading.Lock()
+        self._audio_clients = []  # list of asyncio StreamWriters for audio streaming
+        self._loop = None  # asyncio event loop for scheduling from threads
+        self._connected = False
+        self._frame_count = 0
+        self._read_task = None  # asyncio task for SCO read
+
+    @property
+    def connected(self):
+        return self._connected and self._sco is not None
+
+    async def connect(self):
+        """Establish HSP RFCOMM + SCO audio link."""
+        if not self.bt_addr:
+            print("[Audio] No Bluetooth address configured")
+            return False
+
+        try:
+            # Run blocking BT socket ops in executor
+            loop = asyncio.get_event_loop()
+            self._loop = loop
+            ok = await loop.run_in_executor(None, self._connect_blocking)
+            if ok:
+                print(f"[Audio] Connected to {self.bt_addr}")
+            return ok
+        except Exception as e:
+            print(f"[Audio] Connect failed: {e}")
+            return False
+
+    def _connect_blocking(self):
+        """Blocking connect — runs in executor thread."""
+        # RFCOMM to HSP channel 1
+        self._rfcomm = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, BTPROTO_RFCOMM)
+        self._rfcomm.settimeout(5.0)
+        try:
+            self._rfcomm.connect((self.bt_addr, 1))
+        except Exception as e:
+            print(f"[Audio] RFCOMM connect failed: {e}")
+            self._rfcomm.close()
+            self._rfcomm = None
+            return False
+
+        time.sleep(0.3)
+
+        # Note: AT+CKPD=200 can activate audio routing but causes ERRORs
+        # when CAT serial is also open. SCO works without it.
+        # Only send CKPD if no CAT serial is active.
+        time.sleep(0.3)
+
+        # SCO for audio
+        self._sco = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, BTPROTO_SCO)
+        opt = struct.pack("H", BT_VOICE_CVSD_16BIT)
+        self._sco.setsockopt(SOL_BLUETOOTH, BT_VOICE, opt)
+        self._sco.settimeout(5.0)
+
+        try:
+            self._sco.connect(self.bt_addr)
+        except Exception as e:
+            print(f"[Audio] SCO connect failed: {e}")
+            self._sco.close()
+            self._sco = None
+            self._rfcomm.close()
+            self._rfcomm = None
+            return False
+
+        # Get MTU
+        try:
+            opt = self._sco.getsockopt(SOL_SCO, SCO_OPTIONS, 2)
+            mtu = struct.unpack('H', opt)[0]
+            if self.verbose:
+                print(f"[Audio] SCO MTU: {mtu}")
+        except Exception:
+            pass
+
+        self._connected = True
+        self._frame_count = 0
+        self._running = True
+
+        # Try asyncio-based read first, fall back to threaded
+        try:
+            self._sco.setblocking(False)
+            self._read_task = asyncio.get_event_loop().create_task(self._async_read_loop())
+        except Exception:
+            self._sco.settimeout(1.0)
+            self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
+            self._read_thread.start()
+        return True
+
+    async def disconnect(self):
+        """Tear down audio connection."""
+        self._running = False
+        self._connected = False
+
+        if self._read_task:
+            self._read_task.cancel()
+            try:
+                await self._read_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._read_task = None
+
+        if self._read_thread:
+            self._read_thread.join(timeout=2)
+            self._read_thread = None
+
+        if self._sco:
+            try:
+                self._sco.close()
+            except Exception:
+                pass
+            self._sco = None
+
+        if self._rfcomm:
+            try:
+                self._rfcomm.close()
+            except Exception:
+                pass
+            self._rfcomm = None
+
+        # Close audio streaming clients
+        for writer in list(self._audio_clients):
+            try:
+                writer.close()
+            except Exception:
+                pass
+        self._audio_clients.clear()
+
+        print("[Audio] Disconnected")
+
+    def _read_loop(self):
+        """Continuously read SCO audio frames (runs in thread)."""
+        if self.verbose:
+            print("[Audio] Read loop started")
+
+        while self._running and self._sco:
+            try:
+                data = self._sco.recv(255)
+                if not data:
+                    break
+
+                self._frame_count += 1
+
+                # Buffer for polling reads
+                with self._buf_lock:
+                    # Cap buffer at 1MB (~62 seconds of audio)
+                    if len(self._capture_buf) > 1_000_000:
+                        self._capture_buf = self._capture_buf[-500_000:]
+                    self._capture_buf.extend(data)
+
+                # Forward to streaming clients
+                if self._audio_clients and self._loop:
+                    self._loop.call_soon_threadsafe(
+                        self._forward_audio, bytes(data))
+
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self._running:
+                    print(f"[Audio] Read error: {e}")
+                break
+
+        self._connected = False
+        if self.verbose:
+            print(f"[Audio] Read loop ended ({self._frame_count} frames)")
+
+    async def _async_read_loop(self):
+        """Read SCO audio frames via asyncio (non-blocking socket)."""
+        if self.verbose:
+            print("[Audio] Async read loop started")
+        loop = asyncio.get_event_loop()
+        while self._running and self._sco:
+            try:
+                data = await loop.sock_recv(self._sco, 255)
+                if not data:
+                    break
+                self._frame_count += 1
+                with self._buf_lock:
+                    if len(self._capture_buf) > 1_000_000:
+                        self._capture_buf = self._capture_buf[-500_000:]
+                    self._capture_buf.extend(data)
+                if self._audio_clients:
+                    self._forward_audio(bytes(data))
+            except (OSError, asyncio.CancelledError):
+                break
+        self._connected = False
+        if self.verbose:
+            print(f"[Audio] Async read loop ended ({self._frame_count} frames)")
+
+    def _forward_audio(self, data):
+        """Forward audio data to all streaming TCP clients (called from event loop)."""
+        for writer in list(self._audio_clients):
+            try:
+                writer.write(data)
+            except Exception:
+                self._audio_clients.remove(writer)
+
+    def read_audio(self, nbytes=0):
+        """Read buffered audio data. Returns bytes."""
+        with self._buf_lock:
+            if nbytes <= 0 or nbytes >= len(self._capture_buf):
+                data = bytes(self._capture_buf)
+                self._capture_buf.clear()
+            else:
+                data = bytes(self._capture_buf[:nbytes])
+                del self._capture_buf[:nbytes]
+        return data
+
+    def flush(self):
+        """Clear audio buffer."""
+        with self._buf_lock:
+            self._capture_buf.clear()
+
+    def add_stream_client(self, writer):
+        """Add a TCP writer to receive raw audio stream."""
+        if writer not in self._audio_clients:
+            self._audio_clients.append(writer)
+
+    def remove_stream_client(self, writer):
+        """Remove a TCP writer from audio stream."""
+        if writer in self._audio_clients:
+            self._audio_clients.remove(writer)
+
+    async def write_audio(self, data):
+        """Send audio data to the radio via SCO (for TX)."""
+        if not self._sco:
+            return False
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._write_blocking, data)
+            return True
+        except Exception as e:
+            print(f"[Audio] Write error: {e}")
+            return False
+
+    def _write_blocking(self, data):
+        """Blocking SCO write — runs in executor."""
+        sent = 0
+        while sent < len(data):
+            chunk = data[sent:sent + AUDIO_FRAME_SIZE]
+            if len(chunk) < AUDIO_FRAME_SIZE:
+                chunk = chunk + b'\x00' * (AUDIO_FRAME_SIZE - len(chunk))
+            sent += self._sco.send(chunk)
+
+    def to_dict(self):
+        """Return audio state as dict."""
+        buf_len = len(self._capture_buf)
+        return {
+            'connected': self.connected,
+            'bt_addr': self.bt_addr,
+            'frame_count': self._frame_count,
+            'buffer_bytes': buf_len,
+            'buffer_seconds': round(buf_len / (AUDIO_SAMPLE_RATE * AUDIO_SAMPLE_WIDTH), 2),
+            'stream_clients': len(self._audio_clients),
+            'format': {
+                'sample_rate': AUDIO_SAMPLE_RATE,
+                'sample_width': AUDIO_SAMPLE_WIDTH,
+                'channels': AUDIO_CHANNELS,
+                'encoding': 'signed16le',
+            },
+        }
+
+
+# ============================================================================
+# AUDIO TCP SERVER
+# ============================================================================
+
+class AudioTCPServer:
+    """Dedicated TCP server for raw audio streaming.
+
+    Clients connect and receive a continuous stream of raw PCM audio
+    (8kHz, 16-bit signed LE, mono). No protocol framing — just raw bytes.
+    This allows direct piping to aplay, ffmpeg, Mumble, etc.
+    """
+
+    def __init__(self, audio_mgr, verbose=False):
+        self.audio = audio_mgr
+        self.verbose = verbose
+        self.server = None
+
+    async def start(self, host='0.0.0.0', port=9751):
+        self.server = await asyncio.start_server(
+            self._handle_client, host, port)
+        addr = self.server.sockets[0].getsockname()
+        print(f"[AudioTCP] Streaming server on {addr[0]}:{addr[1]}")
+
+    async def _handle_client(self, reader, writer):
+        addr = writer.get_extra_info('peername')
+        print(f"[AudioTCP] Client connected: {addr}")
+
+        if not self.audio.connected:
+            writer.write(b"ERROR: audio not connected\n")
+            await writer.drain()
+            writer.close()
+            return
+
+        self.audio.add_stream_client(writer)
+        try:
+            # Keep connection alive until client disconnects
+            while True:
+                data = await reader.read(1024)
+                if not data:
+                    break
+        except (asyncio.CancelledError, ConnectionResetError):
+            pass
+        finally:
+            self.audio.remove_stream_client(writer)
+            print(f"[AudioTCP] Client disconnected: {addr}")
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+# ============================================================================
 # TCP SERVER
 # ============================================================================
 
 class TCPServer:
     """TCP server for remote CAT control."""
 
-    def __init__(self, d75serial, password='', verbose=False):
+    def __init__(self, d75serial, password='', verbose=False, audio=None):
         self.serial = d75serial
+        self.audio = audio
         self.password = password
         self.verbose = verbose
         self.server = None
@@ -941,12 +1381,12 @@ class TCPServer:
             if action == 'connect':
                 if self.serial.connected:
                     return 'already connected'
-                # Need comport info — stored as attribute on D75Serial
                 port = getattr(self.serial, '_comport', None)
                 baud = getattr(self.serial, '_baudrate', 9600)
-                if not port:
-                    return 'no comport configured'
-                ok = await self.serial.connect(port, baud)
+                bt = getattr(self.serial, '_bt_addr', '')
+                if not port and not bt:
+                    return 'no comport or bt_addr configured'
+                ok = await self.serial.connect(port, baud, bt_addr=bt or None)
                 return 'connected' if ok else 'connect failed'
             elif action == 'disconnect':
                 await self.serial.disconnect()
@@ -957,7 +1397,39 @@ class TCPServer:
                 return 'usage: !serial connect|disconnect|status'
 
         elif cmd == 'status':
-            return json.dumps(self.serial.state.to_dict())
+            state = self.serial.state.to_dict()
+            if self.audio:
+                state['audio'] = self.audio.to_dict()
+            return json.dumps(state)
+
+        elif cmd == 'audio':
+            if not self.audio:
+                return 'audio not configured (set bt_addr in config.txt)'
+            action = (data or '').strip().lower()
+            if action == 'connect':
+                if self.audio.connected:
+                    return 'already connected'
+                ok = await self.audio.connect()
+                return 'audio connected' if ok else 'audio connect failed'
+            elif action == 'disconnect':
+                await self.audio.disconnect()
+                return 'audio disconnected'
+            elif action == 'status':
+                return json.dumps(self.audio.to_dict())
+            elif action == 'flush':
+                self.audio.flush()
+                return 'buffer flushed'
+            elif action == 'stream':
+                # Add this TCP client to raw audio stream
+                if not self.audio.connected:
+                    return 'audio not connected'
+                self.audio.add_stream_client(writer)
+                return 'streaming started (raw PCM: 8kHz/16-bit/mono)'
+            elif action == 'stop':
+                self.audio.remove_stream_client(writer)
+                return 'streaming stopped'
+            else:
+                return 'usage: !audio connect|disconnect|status|flush|stream|stop'
 
         else:
             return f"Unknown command: {cmd}"
@@ -1004,20 +1476,38 @@ async def main():
                     print(f"  {p.device}: {p.description}")
             return
 
+        bt_addr = settings.get('bt_addr', '')
+        audio_port = int(settings.get('audio_port', '9751'))
+
         print(f"D75 CAT Control Server v{VERSION}")
         print(f"  Serial: {comport} @ {baudrate}")
         print(f"  TCP: {host}:{port}")
+        if bt_addr:
+            print(f"  Bluetooth: {bt_addr}")
+            print(f"  Audio TCP: {host}:{audio_port}")
 
         # Create serial handler
         d75 = D75Serial(verbose=verbose)
         d75._comport = comport
         d75._baudrate = baudrate
+        d75._bt_addr = bt_addr  # Use raw BT socket if set
+
+        # Create audio manager (if Bluetooth configured)
+        audio = None
+        audio_tcp = None
+        if bt_addr:
+            audio = AudioManager(bt_addr, verbose=verbose)
+            audio_tcp = AudioTCPServer(audio, verbose=verbose)
 
         # Create TCP server
-        tcp = TCPServer(d75, password=password, verbose=verbose)
+        tcp = TCPServer(d75, password=password, verbose=verbose, audio=audio)
 
         # Start TCP server task
         tcp_task = asyncio.create_task(tcp.start(host, port))
+
+        # Start audio TCP server if configured
+        if audio_tcp:
+            await audio_tcp.start(host, audio_port)
 
         # Wait for TCP server to be ready
         for _ in range(50):
@@ -1029,6 +1519,8 @@ async def main():
         # (avoids init command storm on restart)
         print(f"[TCP] Ready — waiting for !serial connect")
         print(f"  Serial device: {comport} @ {baudrate}")
+        if bt_addr:
+            print(f"  Audio: !audio connect (or connect to port {audio_port} for raw stream)")
 
         # SIGTERM handler for clean shutdown
         shutdown_event = asyncio.Event()
@@ -1046,9 +1538,17 @@ async def main():
             pass
         finally:
             print("Shutting down...")
+            if audio and audio.connected:
+                await audio.disconnect()
             if d75.connected:
-                d75.transport.serial.dtr = False
+                if d75.transport:
+                    try:
+                        d75.transport.serial.dtr = False
+                    except Exception:
+                        pass
                 await d75.disconnect()
+            if audio_tcp and audio_tcp.server:
+                audio_tcp.server.close()
             if tcp.server:
                 tcp.server.close()
             print("Goodbye.")

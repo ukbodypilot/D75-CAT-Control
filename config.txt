@@ -3,3 +3,5 @@ device=/dev/rfcomm0
 host=0.0.0.0
 port=9750
 password=
+bt_addr=90:CE:B8:D6:55:0A
+audio_port=9751
