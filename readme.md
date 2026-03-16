@@ -41,12 +41,94 @@ For Windows users, you can compile a single file EXE. You can build it by runnin
 Once complete, you will find your EXE in the <i>dist</i> folder.
 
 
+## Headless TCP Server (D75_CAT.py)
+
+A standalone headless TCP server for remote CAT control, designed to integrate with
+[radio-gateway](https://github.com/ukbodypilot/radio-gateway). No GUI or PySide6 required.
+
+### Quick Start
+
+```bash
+# Install dependencies
+pip3 install pyserial pyserial-asyncio --break-system-packages
+
+# Start the server
+python3 D75_CAT.py -c /dev/ttyUSB0 --start-server
+
+# Or install as a systemd service
+./install.sh
+# Edit config.txt to set your serial port, then:
+sudo systemctl start d75-cat
+```
+
+### TCP Protocol
+
+Connect to port 9750 (default). Commands use `!command data\n` format:
+
+```
+!pass <password>          # Authenticate
+!serial connect           # Connect to radio serial port
+!serial disconnect        # Disconnect serial
+!serial status            # Check serial connection
+!cat <CMD> [payload]      # Send raw CAT command (e.g., !cat FQ 0)
+!freq [band] [freq]       # Get/set frequency (e.g., !freq 0 145.500)
+!vol [level]              # Get/set AF gain (0-255)
+!squelch <band> [level]   # Get/set squelch
+!channel <band> [ch]      # Get/set memory channel
+!ptt on|off               # Transmit/receive (uses TX/RX CAT commands)
+!meter [band]             # Read S-meter
+!power <band> [level]     # Get/set output power
+!mode <band> [mode]       # Get/set band mode
+!band [idx]               # Get/set active band (0=A, 1=B)
+!dual [0|1]               # Dual/single band mode
+!gps [on|off] [pcout]     # GPS control
+!bt [on|off]              # Bluetooth control
+!info                     # Radio model, serial number, firmware
+!dtr [on|off]             # Toggle DTR line
+!status                   # Full radio state (JSON)
+!exit                     # Disconnect
+```
+
+### Configuration (config.txt)
+
+```
+baud_rate=9600
+device=                   # Serial port or device description
+host=0.0.0.0              # TCP bind address
+port=9750                 # TCP port (default 9750, avoids conflict with TH9800 on 9800)
+password=                 # TCP auth password (blank = no password)
+```
+
+### Key Differences from GUI Version
+
+- No PySide6/Qt dependency — pure Python asyncio
+- TCP server for remote control (not just local serial)
+- Runs headless as a systemd service
+- Serial uses hardware flow control (RTS/CTS) — RTS is NOT toggled for PTT
+- PTT uses CAT `TX`/`RX` commands directly
+- Command queuing ensures one-at-a-time serial communication
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `D75_CAT.py` | Headless TCP server (main) |
+| `config.txt` | Server configuration |
+| `run-headless.sh` | Startup script (reads config) |
+| `install.sh` | Installs deps + systemd service |
+| `requirements-headless.txt` | Python dependencies |
+
+### Systemd Service
+
+```bash
+sudo systemctl enable d75-cat    # Start on boot
+sudo systemctl start d75-cat     # Start now
+sudo systemctl status d75-cat    # Check status
+journalctl -u d75-cat -f         # Follow logs
+```
+
 ## Future Development
 As this program is in beta stage of development, there is always room for improvement.
-
-Some things that will be coming in future updates.
-* Read GPS, APRS, and KISS data
-* Open TCP/IP ports for other software to access CAT control, GPS data, and APRS data.
 
 If you come across any issues or wish to have features added, please let me know at <a href="mailto:k7dmg@protonmail.com">k7dmg@protonmail.com</a>.
 
