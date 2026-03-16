@@ -360,6 +360,9 @@ class D75Serial:
         self._bt_serial = None  # pyserial on /dev/rfcomm0 (Bluetooth mode)
         self._read_thread = None
         self._loop = None
+        self._consecutive_timeouts = 0  # Track consecutive command timeouts
+        self._reconnecting = False      # Prevent concurrent reconnect attempts
+        self._bt_addr = ''              # Saved for auto-reconnect
 
     async def connect(self, port, baudrate=9600, bt_addr=None):
         """Open serial connection to the radio.
@@ -367,6 +370,9 @@ class D75Serial:
         If bt_addr is provided, uses raw RFCOMM socket to channel 2 instead
         of opening /dev/rfcomm*. This avoids conflicts with SCO audio.
         """
+        self._comport = port
+        self._baudrate = baudrate
+        self._bt_addr = bt_addr or ''
         if bt_addr:
             return await self._connect_bluetooth(bt_addr)
         return await self._connect_serial(port, baudrate)
@@ -514,8 +520,10 @@ class D75Serial:
         except asyncio.TimeoutError:
             if self.verbose:
                 print(f"[Serial] Timeout waiting for response to: {cmd}")
+            await self._handle_timeout()
             return None
 
+        self._consecutive_timeouts = 0
         return self._last_response
 
     async def send_raw(self, text):
@@ -529,8 +537,36 @@ class D75Serial:
         try:
             await asyncio.wait_for(self._response_event.wait(), timeout=3.0)
         except asyncio.TimeoutError:
+            await self._handle_timeout()
             return None
+        self._consecutive_timeouts = 0
         return self._last_response
+
+    async def _handle_timeout(self):
+        """Track consecutive timeouts and auto-reconnect serial if link is dead."""
+        self._consecutive_timeouts += 1
+        if self._consecutive_timeouts >= 3 and not self._reconnecting:
+            print(f"[Serial] {self._consecutive_timeouts} consecutive timeouts — reconnecting...")
+            self._reconnecting = True
+            try:
+                await self.disconnect()
+                await asyncio.sleep(2)
+                bt_addr = self._bt_addr
+                port = getattr(self, '_comport', '/dev/rfcomm0')
+                baud = getattr(self, '_baudrate', 9600)
+                if bt_addr:
+                    ok = await self.connect(port, baud, bt_addr=bt_addr)
+                else:
+                    ok = await self.connect(port, baud)
+                if ok:
+                    print(f"[Serial] Reconnected successfully")
+                    self._consecutive_timeouts = 0
+                else:
+                    print(f"[Serial] Reconnect failed")
+            except Exception as e:
+                print(f"[Serial] Reconnect error: {e}")
+            finally:
+                self._reconnecting = False
 
     async def _command_writer(self):
         """Process command queue — sends one command at a time, waits for response."""
