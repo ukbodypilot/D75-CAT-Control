@@ -1944,8 +1944,13 @@ async def main():
                     except Exception:
                         pass
                 await d75.disconnect()
-            if audio_tcp and audio_tcp.server:
-                audio_tcp.server.close()
+            if audio_tcp:
+                audio_tcp._running = False
+                if audio_tcp._listen_sock:
+                    try:
+                        audio_tcp._listen_sock.close()
+                    except Exception:
+                        pass
             if tcp.server:
                 tcp.server.close()
             print("Goodbye.")
