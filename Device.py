@@ -288,11 +288,16 @@ class Device(QObject):
         self.serial_conn.setDataBits(QSerialPort.Data8)
         self.serial_conn.setParity(QSerialPort.NoParity)
         self.serial_conn.setStopBits(QSerialPort.OneStop)
-        self.serial_conn.setFlowControl(QSerialPort.FlowControl.HardwareControl)
+        # Bluetooth RFCOMM doesn't support hardware flow control
+        if self.serial_port.startswith('/dev/rfcomm'):
+            self.serial_conn.setFlowControl(QSerialPort.FlowControl.NoFlowControl)
+        else:
+            self.serial_conn.setFlowControl(QSerialPort.FlowControl.HardwareControl)
         self.serial_conn.errorOccurred.connect(self.serialPortError)
 
         if self.serial_conn.open(QIODevice.ReadWrite):
-            self.serial_conn.setDataTerminalReady(True)
+            if not self.serial_port.startswith('/dev/rfcomm'):
+                self.serial_conn.setDataTerminalReady(True)
             self.command_buffer = []
             self.getSerialNumber()
             self.getFWVersion()
