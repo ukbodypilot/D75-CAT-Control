@@ -25,6 +25,8 @@ import sys
 import threading
 import time
 
+from Constants import Constants
+
 try:
     import serial
     import serial.tools.list_ports
@@ -216,6 +218,10 @@ class ChannelFrequency:
         self.dstar_sq_code = data[20] if len(data) > 20 and data[17] != 'D' else ''
 
     def to_dict(self):
+        # Resolve tone indices to actual values for display
+        tone_hz = Constants.ctcss_tones[self.tone_freq] if self.tone_freq < len(Constants.ctcss_tones) else ''
+        ctcss_hz = Constants.ctcss_tones[self.ctcss_freq] if self.ctcss_freq < len(Constants.ctcss_tones) else ''
+        dcs_code = Constants.dcs_tones[self.dcs_freq] if self.dcs_freq < len(Constants.dcs_tones) else ''
         return {
             'band': self.band, 'frequency': self.frequency,
             'offset': self.offset, 'step': self.step,
@@ -224,6 +230,7 @@ class ChannelFrequency:
             'shift_direction': self.shift_direction,
             'tone_freq': self.tone_freq, 'ctcss_freq': self.ctcss_freq,
             'dcs_freq': self.dcs_freq,
+            'tone_hz': tone_hz, 'ctcss_hz': ctcss_hz, 'dcs_code': dcs_code,
         }
 
     def to_radio(self):
@@ -1302,6 +1309,31 @@ class TCPServer:
             except Exception:
                 pass
 
+    def _tone_info(self, band):
+        """Get tone info dict for a band from cached state."""
+        fi = self.serial.state.band[band].get('freq_info')
+        if not fi:
+            return {'type': 'unknown'}
+        if fi.ctcss_status:
+            return {'type': 'ctcss', 'freq': Constants.ctcss_tones[fi.ctcss_freq] if fi.ctcss_freq < len(Constants.ctcss_tones) else '?'}
+        elif fi.dcs_status:
+            return {'type': 'dcs', 'code': Constants.dcs_tones[fi.dcs_freq] if fi.dcs_freq < len(Constants.dcs_tones) else '?'}
+        elif fi.tone_status:
+            return {'type': 'tone', 'freq': Constants.ctcss_tones[fi.tone_freq] if fi.tone_freq < len(Constants.ctcss_tones) else '?'}
+        return {'type': 'off'}
+
+    def _offset_info(self, band):
+        """Get offset info for a band from cached state."""
+        fi = self.serial.state.band[band].get('freq_info')
+        return fi.offset if fi else 'unknown'
+
+    def _shift_info(self, band):
+        """Get shift direction for a band from cached state."""
+        fi = self.serial.state.band[band].get('freq_info')
+        if not fi:
+            return 'unknown'
+        return {'0': 'off', '1': '+', '2': '-'}.get(fi.shift_direction, '?')
+
     async def _process_cmd(self, cmd, data, writer, logged_in, login_attempts):
         """Process a TCP command. Returns response string or (response, logged_in, login_attempts)."""
 
@@ -1379,6 +1411,138 @@ class TCPServer:
                 return resp or 'no response'
             else:
                 return f"A:{self.serial.state.band[0]['channel']} B:{self.serial.state.band[1]['channel']}"
+
+        elif cmd == 'tone':
+            # !tone <band> <type> [freq/code]
+            # Types: off, tone, ctcss, dcs
+            # Examples: !tone 0 ctcss 100.0 | !tone 0 dcs 023 | !tone 0 off
+            if not self.serial.connected:
+                return 'serial not connected'
+            parts = data.split() if data else []
+            if len(parts) < 2:
+                # Read current tone setting
+                for b in (0, 1):
+                    fi = self.serial.state.band[b].get('freq_info')
+                    if fi:
+                        if fi.ctcss_status:
+                            tone_desc = f"CTCSS {Constants.ctcss_tones[fi.ctcss_freq]}"
+                        elif fi.dcs_status:
+                            tone_desc = f"DCS {Constants.dcs_tones[fi.dcs_freq]}"
+                        elif fi.tone_status:
+                            tone_desc = f"Tone {Constants.ctcss_tones[fi.tone_freq]}"
+                        else:
+                            tone_desc = "Off"
+                    else:
+                        tone_desc = "unknown"
+                return json.dumps({
+                    'band_0': self._tone_info(0),
+                    'band_1': self._tone_info(1),
+                })
+            band = parts[0]
+            tone_type = parts[1].lower()
+            # Read current FO
+            resp = await self.serial.send_raw(f"FO {band}")
+            if not resp or not resp.startswith('FO'):
+                return 'failed to read FO'
+            fo_data = resp[3:].split(',')
+            if len(fo_data) < 21:
+                return f'FO parse error (got {len(fo_data)} fields)'
+            fi = ChannelFrequency(fo_data)
+            # Modify tone fields
+            if tone_type == 'off':
+                fi.tone_status = False
+                fi.ctcss_status = False
+                fi.dcs_status = False
+            elif tone_type == 'tone':
+                freq = parts[2] if len(parts) > 2 else None
+                if freq and freq in Constants.ctcss_tones:
+                    fi.tone_freq = Constants.ctcss_tones.index(freq)
+                elif freq:
+                    return f'unknown tone freq {freq}. Valid: {", ".join(Constants.ctcss_tones[:10])}...'
+                fi.tone_status = True
+                fi.ctcss_status = False
+                fi.dcs_status = False
+            elif tone_type == 'ctcss':
+                freq = parts[2] if len(parts) > 2 else None
+                if freq and freq in Constants.ctcss_tones:
+                    fi.ctcss_freq = Constants.ctcss_tones.index(freq)
+                elif freq:
+                    return f'unknown CTCSS freq {freq}. Valid: {", ".join(Constants.ctcss_tones[:10])}...'
+                fi.tone_status = False
+                fi.ctcss_status = True
+                fi.dcs_status = False
+            elif tone_type == 'dcs':
+                code = parts[2] if len(parts) > 2 else None
+                if code and code in Constants.dcs_tones:
+                    fi.dcs_freq = Constants.dcs_tones.index(code)
+                elif code:
+                    return f'unknown DCS code {code}. Valid: {", ".join(Constants.dcs_tones[:10])}...'
+                fi.tone_status = False
+                fi.ctcss_status = False
+                fi.dcs_status = True
+            else:
+                return f'unknown tone type: {tone_type}. Use: off, tone, ctcss, dcs'
+            # Write back
+            resp = await self.serial.send_raw(f"FO {fi.to_radio()}")
+            return resp or 'ok'
+
+        elif cmd == 'offset':
+            # !offset <band> [offset_mhz]
+            # Examples: !offset 0 5.000 | !offset 0 0.600
+            if not self.serial.connected:
+                return 'serial not connected'
+            parts = data.split() if data else []
+            if len(parts) < 1:
+                return json.dumps({
+                    'band_0': self._offset_info(0),
+                    'band_1': self._offset_info(1),
+                })
+            band = parts[0]
+            if len(parts) < 2:
+                fi = self.serial.state.band[int(band)].get('freq_info')
+                return fi.offset if fi else 'unknown'
+            offset_mhz = parts[1]
+            # Read current FO
+            resp = await self.serial.send_raw(f"FO {band}")
+            if not resp or not resp.startswith('FO'):
+                return 'failed to read FO'
+            fo_data = resp[3:].split(',')
+            if len(fo_data) < 21:
+                return f'FO parse error'
+            fi = ChannelFrequency(fo_data)
+            fi.offset = offset_mhz
+            resp = await self.serial.send_raw(f"FO {fi.to_radio()}")
+            return resp or 'ok'
+
+        elif cmd == 'shift':
+            # !shift <band> [0|+|-|off|plus|minus]
+            if not self.serial.connected:
+                return 'serial not connected'
+            parts = data.split() if data else []
+            if len(parts) < 1:
+                return json.dumps({
+                    'band_0': self._shift_info(0),
+                    'band_1': self._shift_info(1),
+                })
+            band = parts[0]
+            if len(parts) < 2:
+                fi = self.serial.state.band[int(band)].get('freq_info')
+                return {'0': 'off', '1': '+', '2': '-'}.get(fi.shift_direction, '?') if fi else 'unknown'
+            val = parts[1].lower()
+            shift_map = {'0': '0', 'off': '0', '1': '1', '+': '1', 'plus': '1', '2': '2', '-': '2', 'minus': '2'}
+            if val not in shift_map:
+                return f'invalid shift: {val}. Use: off, +, -, 0, 1, 2'
+            # Read current FO
+            resp = await self.serial.send_raw(f"FO {band}")
+            if not resp or not resp.startswith('FO'):
+                return 'failed to read FO'
+            fo_data = resp[3:].split(',')
+            if len(fo_data) < 21:
+                return f'FO parse error'
+            fi = ChannelFrequency(fo_data)
+            fi.shift_direction = shift_map[val]
+            resp = await self.serial.send_raw(f"FO {fi.to_radio()}")
+            return resp or 'ok'
 
         elif cmd == 'ptt':
             if not self.serial.connected:
