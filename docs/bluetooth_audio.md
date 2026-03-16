@@ -102,20 +102,22 @@ monitor.bluez.properties = {
 
 ### Connection Sequence
 
-1. **Bind rfcomm0** — `sudo rfcomm bind 0 <MAC> 2` creates the device node
-   and may establish the ACL link.
-
-2. **RFCOMM ch1** — Open a raw Bluetooth RFCOMM socket to the D75's channel 1
+1. **RFCOMM ch1** — Open a raw Bluetooth RFCOMM socket to the D75's channel 1
    (Headset AG). This establishes the HSP service-level connection.
+   **Must be done BEFORE rfcomm bind to ch2** — binding ch2 blocks the D75
+   from accepting new RFCOMM ch1 connections.
 
-3. **SCO socket** — Open an outbound SCO (Synchronous Connection-Oriented)
+2. **SCO socket** — Open an outbound SCO (Synchronous Connection-Oriented)
    socket to the D75. This creates the audio transport.
 
-4. **AT+CKPD=200** — Send this HSP "button press" command over RFCOMM to
+3. **AT+CKPD=200** — Send this HSP "button press" command over RFCOMM to
    activate audio routing on the radio. The D75 responds with `OK`.
    **Critical: CKPD must be sent AFTER SCO connects but BEFORE CAT serial opens.**
    Sending CKPD while CAT serial is active on rfcomm0 causes cross-channel
    errors that break SCO.
+
+4. **Bind rfcomm0** — `sudo rfcomm bind 0 <MAC> 2` creates the device node
+   for CAT serial. This must be done after audio is established.
 
 5. **Open CAT serial** — Open `/dev/rfcomm0` via pyserial.
 

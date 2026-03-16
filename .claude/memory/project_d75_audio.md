@@ -26,24 +26,25 @@ Key findings (2026-03-16):
 - RFCOMM ch1 must stay open during audio (closing it drops SCO)
 
 **Correct BT startup sequence (implemented as !btstart):**
-1. Bind rfcomm0 (sudo rfcomm bind 0 addr 2) — creates device node, may establish ACL
-2. Connect audio: RFCOMM ch1 → SCO → AT+CKPD=200 (CKPD AFTER SCO, BEFORE serial)
+1. Connect audio: RFCOMM ch1 → SCO → AT+CKPD=200 (must be FIRST — rfcomm bind blocks ch1)
+2. Bind rfcomm0 (sudo rfcomm bind 0 addr 2) — after audio is established
 3. Open serial on /dev/rfcomm0 via pyserial
 
-**Critical: CKPD must be sent AFTER SCO connects but BEFORE serial opens.**
+**Critical ordering rules:**
+- Audio (RFCOMM ch1 + SCO + CKPD) MUST connect BEFORE rfcomm bind to ch2
+- rfcomm bind to ch2 blocks the D75 from accepting new RFCOMM ch1 connections
+- CKPD must be sent AFTER SCO connects but BEFORE serial opens
 
-**Current status (2026-03-16, post CSR adapter switch):**
-- bt_full_test.py passes: CAT + Audio simultaneous, peak=1036
-- TCP CAT control fully working (port 9750, !command protocol verified)
+**Current status (2026-03-16, fully working):**
+- !btstart end-to-end verified: audio+CKPD → rfcomm bind → serial all succeed
+- TCP CAT control working (port 9750, !command protocol, auth via !pass)
 - AudioManager + AudioTCPServer (port 9751) streams raw PCM to clients
-- !btstart command does correct startup sequence
-- Both servers have reuse_address=True to avoid port bind issues
+- bt_full_test.py passes: CAT + Audio simultaneous, peak=1036
+- CSR adapter confirmed reliable for SCO
 
 **Next steps:**
-1. Test !btstart end-to-end: TCP CAT + audio streaming via port 9751
-2. Verify audio stream has real signal through TCP server
-3. Build D75 CAT client for radio-gateway integration
-4. Wire D75 audio into gateway via RemoteAudioSource (8k→48k resample)
+1. Build D75 CAT client for radio-gateway integration
+2. Wire D75 audio into gateway via RemoteAudioSource (8k→48k resample)
 
 **Why:** Remote audio streaming through headless TCP server for radio-gateway integration.
 **How to apply:** Use !btstart for proper startup. Test scripts: bt_audio_test.py, bt_dual_test.py, bt_full_test.py.

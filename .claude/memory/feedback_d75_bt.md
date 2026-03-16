@@ -15,8 +15,8 @@ SCO audio must use outbound connect (socket.connect), not listen/accept.
 For CAT serial over Bluetooth: use pyserial on /dev/rfcomm0 (blocking, threaded read). Do NOT use serial_asyncio — it conflicts with SCO audio causing EBUSY errors. Raw BT RFCOMM sockets in non-blocking mode also conflict with SCO.
 
 Correct BT startup order (!btstart):
-1. Bind rfcomm0 (creates device node)
-2. RFCOMM ch1 connect → SCO connect → AT+CKPD=200
+1. RFCOMM ch1 connect → SCO connect → AT+CKPD=200 (MUST be before rfcomm bind)
+2. Bind rfcomm0 (rfcomm bind to ch2 blocks D75 from accepting ch1)
 3. Open serial on /dev/rfcomm0
 
 AudioManager._connect_blocking: always use threaded SCO read loop (not asyncio). The asyncio approach fails because _connect_blocking runs in an executor thread where asyncio.get_event_loop().create_task() doesn't work.

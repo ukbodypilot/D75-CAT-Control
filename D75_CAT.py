@@ -1465,8 +1465,9 @@ class TCPServer:
                 return 'usage: !audio connect|disconnect|status|flush|stream|stop'
 
         elif cmd == 'btstart':
-            # Full Bluetooth startup: bind rfcomm → audio+CKPD → serial
-            # This is the correct sequence for simultaneous CAT+audio.
+            # Full Bluetooth startup: audio+CKPD → bind rfcomm → serial
+            # Audio (RFCOMM ch1 + SCO) must connect BEFORE rfcomm bind,
+            # because rfcomm bind to ch2 blocks D75 from accepting ch1.
             if not self.audio:
                 return 'audio not configured (set bt_addr in config.txt)'
             bt = getattr(self.serial, '_bt_addr', '')
@@ -1477,18 +1478,18 @@ class TCPServer:
 
             steps = []
 
-            # Step 1: Bind rfcomm0 (establishes ACL link)
-            await self.serial.bind_rfcomm(bt)
-            steps.append('rfcomm bound')
-            await asyncio.sleep(0.5)
-
-            # Step 2: Connect audio with CKPD (before serial opens)
+            # Step 1: Connect audio with CKPD (must be before rfcomm bind)
             if not self.audio.connected:
                 ok = await self.audio.connect(send_ckpd=True)
                 steps.append('audio+CKPD' if ok else 'audio FAILED')
                 if not ok:
                     return f"btstart partial: {', '.join(steps)}"
                 await asyncio.sleep(0.5)
+
+            # Step 2: Bind rfcomm0 (after audio is established)
+            await self.serial.bind_rfcomm(bt)
+            steps.append('rfcomm bound')
+            await asyncio.sleep(0.5)
 
             # Step 3: Open serial on /dev/rfcomm0
             if not self.serial.connected:
