@@ -398,15 +398,26 @@ class D75Serial:
             print(f"[Serial] Connection failed: {e}")
             return False
 
+    async def bind_rfcomm(self, bt_addr):
+        """Bind /dev/rfcomm0 to the BT address without opening serial.
+
+        This establishes the ACL link so audio can connect before serial opens.
+        """
+        import subprocess
+        subprocess.run(['sudo', 'rfcomm', 'bind', '0', bt_addr, '2'],
+                       capture_output=True, timeout=5)
+        print(f"[Serial] rfcomm0 bound to {bt_addr} ch2")
+
     async def _connect_bluetooth(self, bt_addr):
         """Connect via pyserial on /dev/rfcomm0 bound to the BT address.
 
         Uses synchronous pyserial (not serial_asyncio) to avoid conflicts
         with SCO audio. Read loop runs in a thread.
+        Call bind_rfcomm() first if audio needs to connect before serial.
         """
         loop = asyncio.get_event_loop()
 
-        # Ensure rfcomm0 is bound
+        # Ensure rfcomm0 is bound (no-op if already bound)
         import subprocess
         subprocess.run(['sudo', 'rfcomm', 'bind', '0', bt_addr, '2'],
                        capture_output=True, timeout=5)
@@ -797,13 +808,18 @@ class AudioManager:
         self._connected = False
         self._frame_count = 0
         self._read_task = None  # asyncio task for SCO read
+        self._ckpd_sent = False  # whether AT+CKPD=200 has been sent to activate audio routing
 
     @property
     def connected(self):
         return self._connected and self._sco is not None
 
-    async def connect(self):
-        """Establish HSP RFCOMM + SCO audio link."""
+    async def connect(self, send_ckpd=True):
+        """Establish HSP RFCOMM + SCO audio link.
+
+        send_ckpd: If True, send AT+CKPD=200 to activate audio routing.
+                   Set False if CAT serial is already open (causes cross-channel errors).
+        """
         if not self.bt_addr:
             print("[Audio] No Bluetooth address configured")
             return False
@@ -812,15 +828,16 @@ class AudioManager:
             # Run blocking BT socket ops in executor
             loop = asyncio.get_event_loop()
             self._loop = loop
-            ok = await loop.run_in_executor(None, self._connect_blocking)
+            ok = await loop.run_in_executor(None, self._connect_blocking, send_ckpd)
             if ok:
-                print(f"[Audio] Connected to {self.bt_addr}")
+                ckpd_status = " (CKPD sent)" if self._ckpd_sent else " (no CKPD)"
+                print(f"[Audio] Connected to {self.bt_addr}{ckpd_status}")
             return ok
         except Exception as e:
             print(f"[Audio] Connect failed: {e}")
             return False
 
-    def _connect_blocking(self):
+    def _connect_blocking(self, send_ckpd=True):
         """Blocking connect — runs in executor thread."""
         # RFCOMM to HSP channel 1
         self._rfcomm = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, BTPROTO_RFCOMM)
@@ -835,11 +852,7 @@ class AudioManager:
 
         time.sleep(0.3)
 
-        # Note: AT+CKPD=200 can activate audio routing but causes ERRORs
-        # when CAT serial is also open. SCO works without it.
-        # Only send CKPD if no CAT serial is active.
-        time.sleep(0.3)
-
+        # SCO must be connected BEFORE sending CKPD (matches working bt_full_test.py order)
         # SCO for audio
         self._sco = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, BTPROTO_SCO)
         opt = struct.pack("H", BT_VOICE_CVSD_16BIT)
@@ -865,18 +878,34 @@ class AudioManager:
         except Exception:
             pass
 
+        # AT+CKPD=200 activates audio routing on the D75.
+        # Must be sent AFTER SCO is connected. MUST NOT be sent when CAT serial
+        # is open — causes cross-channel errors.
+        if send_ckpd:
+            try:
+                self._rfcomm.sendall(b'AT+CKPD=200\r')
+                time.sleep(0.5)
+                resp = self._rfcomm.recv(256)
+                resp_text = resp.decode('utf-8', errors='ignore').strip()
+                if self.verbose:
+                    print(f"[Audio] CKPD response: {resp_text}")
+                self._ckpd_sent = 'OK' in resp_text
+                if not self._ckpd_sent:
+                    print(f"[Audio] CKPD unexpected response: {resp_text}")
+            except Exception as e:
+                print(f"[Audio] CKPD failed: {e}")
+                self._ckpd_sent = False
+        else:
+            self._ckpd_sent = False
+
         self._connected = True
         self._frame_count = 0
         self._running = True
 
-        # Try asyncio-based read first, fall back to threaded
-        try:
-            self._sco.setblocking(False)
-            self._read_task = asyncio.get_event_loop().create_task(self._async_read_loop())
-        except Exception:
-            self._sco.settimeout(1.0)
-            self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
-            self._read_thread.start()
+        # Start read loop — threaded (avoids asyncio issues from executor thread)
+        self._sco.settimeout(1.0)
+        self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._read_thread.start()
         return True
 
     async def disconnect(self):
@@ -1072,7 +1101,8 @@ class AudioTCPServer:
 
     async def start(self, host='0.0.0.0', port=9751):
         self.server = await asyncio.start_server(
-            self._handle_client, host, port)
+            self._handle_client, host, port,
+            reuse_address=True)
         addr = self.server.sockets[0].getsockname()
         print(f"[AudioTCP] Streaming server on {addr[0]}:{addr[1]}")
 
@@ -1122,7 +1152,8 @@ class TCPServer:
 
     async def start(self, host='0.0.0.0', port=9750):
         self.server = await asyncio.start_server(
-            self._handle_client, host, port)
+            self._handle_client, host, port,
+            reuse_address=True)
         addr = self.server.sockets[0].getsockname()
         print(f"[TCP] Server running on {addr[0]}:{addr[1]}")
         self.ready = True
@@ -1409,7 +1440,9 @@ class TCPServer:
             if action == 'connect':
                 if self.audio.connected:
                     return 'already connected'
-                ok = await self.audio.connect()
+                # Send CKPD only when CAT serial is NOT open
+                send_ckpd = not self.serial.connected
+                ok = await self.audio.connect(send_ckpd=send_ckpd)
                 return 'audio connected' if ok else 'audio connect failed'
             elif action == 'disconnect':
                 await self.audio.disconnect()
@@ -1430,6 +1463,43 @@ class TCPServer:
                 return 'streaming stopped'
             else:
                 return 'usage: !audio connect|disconnect|status|flush|stream|stop'
+
+        elif cmd == 'btstart':
+            # Full Bluetooth startup: bind rfcomm → audio+CKPD → serial
+            # This is the correct sequence for simultaneous CAT+audio.
+            if not self.audio:
+                return 'audio not configured (set bt_addr in config.txt)'
+            bt = getattr(self.serial, '_bt_addr', '')
+            if not bt:
+                return 'no bt_addr configured'
+            if self.serial.connected and self.audio.connected:
+                return 'already connected (serial + audio)'
+
+            steps = []
+
+            # Step 1: Bind rfcomm0 (establishes ACL link)
+            await self.serial.bind_rfcomm(bt)
+            steps.append('rfcomm bound')
+            await asyncio.sleep(0.5)
+
+            # Step 2: Connect audio with CKPD (before serial opens)
+            if not self.audio.connected:
+                ok = await self.audio.connect(send_ckpd=True)
+                steps.append('audio+CKPD' if ok else 'audio FAILED')
+                if not ok:
+                    return f"btstart partial: {', '.join(steps)}"
+                await asyncio.sleep(0.5)
+
+            # Step 3: Open serial on /dev/rfcomm0
+            if not self.serial.connected:
+                port = getattr(self.serial, '_comport', '/dev/rfcomm0')
+                baud = getattr(self.serial, '_baudrate', 9600)
+                ok = await self.serial.connect(port, baud, bt_addr=bt)
+                steps.append('serial' if ok else 'serial FAILED')
+                if not ok:
+                    return f"btstart partial: {', '.join(steps)}"
+
+            return f"btstart OK: {', '.join(steps)}"
 
         else:
             return f"Unknown command: {cmd}"
