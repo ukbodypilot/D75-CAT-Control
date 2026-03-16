@@ -1791,7 +1791,7 @@ class TCPServer:
                 return 'usage: !audio connect|disconnect|status|flush|stream|stop'
 
         elif cmd == 'btstart':
-            # Full Bluetooth startup: audio+CKPD → bind rfcomm → serial
+            # Full Bluetooth startup: cleanup → audio+CKPD → bind rfcomm → serial
             # Audio (RFCOMM ch1 + SCO) must connect BEFORE rfcomm bind,
             # because rfcomm bind to ch2 blocks D75 from accepting ch1.
             if not self.audio:
@@ -1804,9 +1804,30 @@ class TCPServer:
 
             steps = []
 
+            # Step 0: Clean up stale BT connections from previous session
+            # This prevents the D75 from being stuck after an unclean disconnect
+            import subprocess
+            subprocess.run(['sudo', 'hcitool', 'dc', bt],
+                           capture_output=True, timeout=5)
+            subprocess.run(['sudo', 'rfcomm', 'release', '0'],
+                           capture_output=True, timeout=5)
+            await asyncio.sleep(1)
+
             # Step 1: Connect audio with CKPD (must be before rfcomm bind)
+            # Retry with backoff — the D75 may need time after disconnect
             if not self.audio.connected:
-                ok = await self.audio.connect(send_ckpd=True)
+                ok = False
+                for attempt in range(3):
+                    ok = await self.audio.connect(send_ckpd=True)
+                    if ok:
+                        break
+                    wait = (attempt + 1) * 3  # 3s, 6s, 9s
+                    print(f"[btstart] Audio connect attempt {attempt+1} failed, retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                    # Clean disconnect before retry
+                    subprocess.run(['sudo', 'hcitool', 'dc', bt],
+                                   capture_output=True, timeout=5)
+                    await asyncio.sleep(1)
                 steps.append('audio+CKPD' if ok else 'audio FAILED')
                 if not ok:
                     return f"btstart partial: {', '.join(steps)}"
