@@ -1639,6 +1639,81 @@ class TCPServer:
             s = self.serial.state
             return f"Model:{s.model_id} S/N:{s.serial_number} FW:{s.fw_version} Type:{s.radio_type}"
 
+        elif cmd == 'battery':
+            if not self.serial.connected:
+                return 'serial not connected'
+            resp = await self.serial.send_command(CAT.BatteryLevel)
+            return resp or 'no response'
+
+        elif cmd == 'up':
+            if not self.serial.connected:
+                return 'serial not connected'
+            resp = await self.serial.send_raw("UP")
+            return resp or 'ok'
+
+        elif cmd == 'down':
+            if not self.serial.connected:
+                return 'serial not connected'
+            resp = await self.serial.send_raw("DW")
+            return resp or 'ok'
+
+        elif cmd == 'vfomode':
+            # !vfomode <band> [vfo|mem|call|dv]
+            if not self.serial.connected:
+                return 'serial not connected'
+            parts = data.split() if data else []
+            mode_map = {'vfo': '0', 'mem': '1', 'memory': '1', 'call': '2', 'dv': '3'}
+            if len(parts) == 2:
+                val = mode_map.get(parts[1].lower(), parts[1])
+                resp = await self.serial.send_command(CAT.MemoryMode, f"{parts[0]},{val}")
+                return resp or 'ok'
+            elif len(parts) == 1:
+                resp = await self.serial.send_command(CAT.MemoryMode, parts[0])
+                return resp or 'no response'
+            else:
+                mm = {0: 'VFO', 1: 'Memory', 2: 'Call', 3: 'DV'}
+                return json.dumps({
+                    'band_0': mm.get(self.serial.state.band[0].get('memory_mode', 0), '?'),
+                    'band_1': mm.get(self.serial.state.band[1].get('memory_mode', 0), '?'),
+                })
+
+        elif cmd == 'backlight':
+            if not self.serial.connected:
+                return 'serial not connected'
+            if data:
+                bl_map = {'off': '0', 'manual': '0', 'on': '1', 'auto': '2', 'auto-dc': '3'}
+                val = bl_map.get(data.strip().lower(), data.strip())
+                resp = await self.serial.send_command(CAT.Backlight, val)
+                return resp or 'ok'
+            else:
+                return str(self.serial.state.backlight)
+
+        elif cmd == 'beacon':
+            if not self.serial.connected:
+                return 'serial not connected'
+            if data and data.strip().lower() == 'send':
+                resp = await self.serial.send_command(CAT.Beacon)
+                return resp or 'ok'
+            else:
+                bt_map = {0: 'Manual', 1: 'PTT', 2: 'Auto', 3: 'SmartBeaconing'}
+                return bt_map.get(self.serial.state.beacon_type, str(self.serial.state.beacon_type))
+
+        elif cmd == 'tnc':
+            if not self.serial.connected:
+                return 'serial not connected'
+            parts = data.split() if data else []
+            if len(parts) == 2:
+                mode_map = {'off': '0', 'aprs': '1', 'kiss': '2'}
+                mode = mode_map.get(parts[0].lower(), parts[0])
+                resp = await self.serial.send_command(CAT.TNC, f"{mode},{parts[1]}")
+                return resp or 'ok'
+            else:
+                tnc_modes = {0: 'Off', 1: 'APRS', 2: 'KISS'}
+                return json.dumps({
+                    'mode': tnc_modes.get(self.serial.state.tnc[0], '?'),
+                    'band': self.serial.state.tnc[1]
+                })
+
         elif cmd == 'dtr':
             if not self.serial.connected:
                 return 'serial not connected'
