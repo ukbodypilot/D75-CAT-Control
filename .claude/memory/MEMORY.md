@@ -1,3 +1,3 @@
-- [user_ham_radio.md](user_ham_radio.md) — User is a ham radio operator working on D74/D75 CAT control
-- [project_d75_audio.md](project_d75_audio.md) — Bluetooth audio via HSP/SCO on D75 - full technical details
-- [feedback_d75_bt.md](feedback_d75_bt.md) — D75 BT protocol quirks: no HFP commands, outbound SCO only
+- [user_ham_radio.md](user_ham_radio.md) — User is a ham radio operator working on D74/D75 CAT control and radio-gateway
+- [project_d75_audio.md](project_d75_audio.md) — D75 CAT + BT audio: gateway integration, web UI, auto-recovery, all features
+- [feedback_d75_bt.md](feedback_d75_bt.md) — D75 BT protocol rules: adapter selection, startup order, resampling, reliability patterns

@@ -1,37 +1,35 @@
 ---
 name: D75 CAT Control - Bluetooth Audio
-description: Bluetooth audio via HSP/SCO on D75 - full technical details and integration status
+description: Bluetooth audio via HSP/SCO on D75 - full technical details, gateway integration, reliability
 type: project
 ---
 
-CAT control works on RFCOMM ch2 (/dev/rfcomm0). Audio works via HSP on RFCOMM ch1 + SCO.
-Both run simultaneously over Bluetooth — no drop/reconnect needed.
+**Status (2026-03-16):** Fully working with auto-recovery. Gateway integration complete. Web UI has all radio controls. BT reconnect with HCI cleanup + 3x retry handles unclean disconnects without manual radio intervention.
 
-D75 BT MAC: 90:CE:B8:D6:55:0A
-Pi BT adapter: 9C:AD:EF:FE:13:BF (hci0) — CSR (Cambridge Silicon Radio) USB, vendor 6242:8202
+**Architecture:**
+- D75_CAT.py: headless TCP server, manages BT audio (SCO) + CAT serial (RFCOMM)
+- Gateway: D75CATClient (CAT over TCP) + D75AudioSource (audio over TCP, 8k→48k resample)
+- Web UI: /d75 page with full dual-band controls
 
-**Adapter history:** RTL8761BU has fatal SCO firmware bug. CSR adapter works but has ~48% SCO frame loss (stuck frames). Fixed with stuck frame filter in _read_loop.
+**Connection modes:** D75_CONNECTION = 'bluetooth' or 'usb'
 
-**Correct BT startup sequence (implemented as !btstart):**
-1. Connect audio: RFCOMM ch1 → SCO → AT+CKPD=200 (must be FIRST — rfcomm bind blocks ch1)
-2. Bind rfcomm0 (sudo rfcomm bind 0 addr 2) — after audio is established
-3. Open serial on /dev/rfcomm0 via pyserial
+**Auto-recovery (verified working 2026-03-16):**
+- btstart: HCI disconnect + rfcomm release before connecting, 3x retry with 3/6/9s backoff
+- Gateway btstart runs in background thread (doesn't block startup)
+- Serial reconnect: rfcomm release + rebind on timeout, max 3 attempts
+- Command writer: detects OSError, marks connection dead, unblocks waiters
+- Systemd: Restart=always with 10s delay
 
-**Audio TCP streaming:** Raw socket forwarding (not asyncio). AudioTCPServer uses threading accept loop, _forward_audio uses sock.sendall() from SCO read thread. Port 9751.
+**Web UI features (/d75 page):**
+- Dual-band: frequency, mode, power, squelch, S-meter
+- CTCSS/DCS tone selector, offset, shift direction
+- VFO/Memory mode toggle, memory channel input
+- Active band (A/B), dual/single band
+- Up/Down dial buttons
+- Volume slider, BT Start, PTT
+- GPS panel (lat/lon/alt/speed/sats)
+- Battery level, BT state, TNC mode, beacon type
+- Dashboard: D75 orange level bar + connection status
 
-**SCO stuck frame filter:** CSR adapter repeats last sample for all 24 positions in dropped packets. _read_loop detects stuck frames (unique values <= 2) and replaces with faded copy of last good frame. Reduces stuck rate from 48% to ~4%.
-
-**Gateway integration (2026-03-16, fully working):**
-- D75AudioSource: TCP client to port 9751, 6x linear interpolation (8kHz→48kHz) with boundary continuity (_prev_last), queues for mixer
-- D75CATClient: TCP client to port 9750, text !command protocol, polls !status every 2s, send_command() pauses polling to avoid race condition
-- Config: ENABLE_D75, D75_HOST, D75_PORT, D75_AUDIO_PORT, D75_PASSWORD, D75_AUDIO_BOOST, etc.
-- Web UI: /d75 control page (dual-band freq/squelch/mode/power), /d75status + /d75cmd endpoints
-- Dashboard: D75 orange audio level bar, connection status, mute indicator
-- Nav links conditional on ENABLE flags (ENABLE_TH9800, ENABLE_D75)
-- Keyboard 'w' mutes D75 audio
-- Systemd service manages gateway (don't start manually or you get duplicates!)
-
-**D75 BT quirk:** D75 goes unresponsive after rapid connect/disconnect cycles. Must toggle BT off/on on radio to recover. Avoid killing D75 server unnecessarily.
-
-**Why:** Remote audio streaming + CAT control through headless TCP server for radio-gateway integration.
-**How to apply:** Use systemd to manage gateway. D75_CAT.py runs separately. !btstart handles full connection sequence.
+**Why:** Remote radio control + audio streaming for radio-gateway Mumble bridge.
+**How to apply:** Use systemd for both services. Auto-recovery handles BT hiccups. D75 BT toggle only needed if adapter hardware fails.
