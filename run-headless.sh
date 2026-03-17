@@ -39,6 +39,21 @@ else
     COMPORT="$DEVICE"
 fi
 
+# If device is rfcomm, check if bt_addr is configured
+# When bt_addr is set, D75_CAT.py handles BT connect via !btstart
+# (rfcomm bind must happen AFTER audio SCO connects — see btstart order)
+# So we skip the serial port check and let D75_CAT.py manage everything
+BT_ADDR=""
+if [ -f "$CONFIG" ]; then
+    BT_ADDR=$(grep -m1 "^bt_addr" "$CONFIG" | cut -d= -f2 | xargs)
+fi
+
+if [ -z "$COMPORT" ] && [ -n "$BT_ADDR" ]; then
+    # BT mode — don't bind rfcomm here, btstart will handle it
+    COMPORT="$DEVICE"
+    echo "Bluetooth mode: $BT_ADDR — serial will be connected via btstart"
+fi
+
 if [ -z "$COMPORT" ]; then
     echo "Error: No serial port found for device '$DEVICE'"
     echo "Available ports:"

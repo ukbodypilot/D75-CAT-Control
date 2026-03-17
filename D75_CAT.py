@@ -1159,20 +1159,28 @@ class AudioManager:
             if sock in self._audio_clients:
                 self._audio_clients.remove(sock)
 
+    _write_logged = False
+
     async def write_audio(self, data):
         """Send audio data to the radio via SCO (for TX)."""
         if not self._sco:
+            if not self._write_logged:
+                print(f"[Audio] write_audio: no SCO socket", flush=True)
+                self._write_logged = True
             return False
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._write_blocking, data)
             return True
         except Exception as e:
-            print(f"[Audio] Write error: {e}")
+            print(f"[Audio] Write error: {e}", flush=True)
             return False
 
     def _write_blocking(self, data):
         """Blocking SCO write — runs in executor."""
+        if not self._write_logged:
+            print(f"[Audio] SCO write: {len(data)} bytes in {len(data)//AUDIO_FRAME_SIZE} frames", flush=True)
+            self._write_logged = True
         sent = 0
         while sent < len(data):
             chunk = data[sent:sent + AUDIO_FRAME_SIZE]
@@ -1218,9 +1226,11 @@ class AudioTCPServer:
         self._listen_sock = None
         self._accept_thread = None
         self._running = False
+        self._loop = None  # Event loop reference for cross-thread coroutine scheduling
 
     async def start(self, host='0.0.0.0', port=9751):
         """Start the raw socket listener in a thread."""
+        self._loop = asyncio.get_event_loop()
         self._listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listen_sock.settimeout(1.0)
@@ -1247,12 +1257,47 @@ class AudioTCPServer:
                     conn.close()
                     continue
                 self.audio.add_stream_client(conn)
+                # Start a reader thread for TX audio input from this client
+                threading.Thread(
+                    target=self._read_tx_audio, args=(conn, addr),
+                    daemon=True, name=f"AudioTCP-rx-{addr[1]}").start()
             except socket.timeout:
                 continue
             except Exception as e:
                 if self._running:
                     print(f"[AudioTCP] Accept error: {e}")
                 break
+
+    def _read_tx_audio(self, conn, addr):
+        """Read raw 8kHz PCM from client and write to SCO for TX."""
+        _logged = False
+        try:
+            conn.settimeout(1.0)
+            while self._running:
+                try:
+                    data = conn.recv(4096)
+                    if not data:
+                        break
+                    if not _logged:
+                        print(f"[AudioTCP] TX audio received from {addr}: {len(data)} bytes, audio.connected={self.audio.connected}", flush=True)
+                        _logged = True
+                    if self.audio.connected:
+                        # Write directly to SCO (we're already in a thread)
+                        try:
+                            self.audio._write_blocking(data)
+                        except Exception as e:
+                            if not _logged:
+                                print(f"[AudioTCP] SCO write error: {e}", flush=True)
+                except socket.timeout:
+                    continue
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    break
+        except Exception as e:
+            if self.verbose:
+                print(f"[AudioTCP] TX reader error from {addr}: {e}")
+        finally:
+            if self.verbose:
+                print(f"[AudioTCP] TX reader closed: {addr}")
 
 
 # ============================================================================
@@ -1968,12 +2013,25 @@ async def main():
                 break
             await asyncio.sleep(0.1)
 
-        # Don't auto-connect serial — let user connect via !serial connect
-        # (avoids init command storm on restart)
-        print(f"[TCP] Ready — waiting for !serial connect")
-        print(f"  Serial device: {comport} @ {baudrate}")
-        if bt_addr:
-            print(f"  Audio: !audio connect (or connect to port {audio_port} for raw stream)")
+        # Auto-connect: if BT configured, use btstart (handles audio→rfcomm→serial).
+        # If no BT, just connect serial directly.
+        async def _auto_connect():
+            await asyncio.sleep(1)  # Let TCP server finish binding
+            if bt_addr and audio:
+                print(f"[Startup] Running btstart (audio → rfcomm → serial)...", flush=True)
+                try:
+                    result = await tcp._process_cmd('btstart', '', None, True, 0)
+                    print(f"[Startup] btstart: {result}", flush=True)
+                except Exception as e:
+                    print(f"[Startup] btstart error: {e}", flush=True)
+            else:
+                print(f"[Startup] Connecting serial (no BT)...", flush=True)
+                try:
+                    ok = await d75.connect(comport, baudrate)
+                    print(f"[Startup] Serial: {'connected' if ok else 'failed'}", flush=True)
+                except Exception as e:
+                    print(f"[Startup] Serial connect error: {e}", flush=True)
+        asyncio.create_task(_auto_connect())
 
         # SIGTERM handler for clean shutdown
         shutdown_event = asyncio.Event()

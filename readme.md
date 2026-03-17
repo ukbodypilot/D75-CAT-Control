@@ -8,9 +8,12 @@ Forked from [xbenkozx/D75-CAT-Control](https://github.com/xbenkozx/D75-CAT-Contr
 
 - TCP server for remote CAT control (port 9750)
 - Bluetooth HSP/SCO audio streaming (port 9751) — 8kHz 16-bit mono PCM
+- **Bidirectional BT audio** — RX (radio→gateway) and TX (gateway→radio) over SCO
 - USB cable serial connection (CAT only, audio via AIOC)
 - Simultaneous CAT + audio over Bluetooth
 - Stuck SCO frame filtering for clean audio on CSR adapters
+- **Auto-connect on startup** — serial + btstart runs automatically when BT is configured
+- **Auto-reconnect** — gateway D75CATClient reconnects on connection loss
 - Systemd service for headless operation
 - Web control UI when used with radio-gateway (`/d75` page)
 - No GUI or PySide6 dependency
@@ -100,13 +103,16 @@ D75_PASSWORD =
 ```
 
 ### Gateway features:
-- **`/d75` web page** — Dual-band frequency display, squelch/mode/power controls, S-meter, volume
-- **D75AudioSource** — TCP client to port 9751, resamples 8kHz→48kHz (linear interpolation), feeds mixer
-- **D75CATClient** — TCP client to port 9750, polls radio state, sends commands from web UI
+- **`/d75` web page** — Dual-band frequency display, squelch/mode/power controls, S-meter, volume, PTT
+- **D75AudioSource** — TCP client to port 9751, bidirectional: RX resamples 8kHz→48kHz, TX downsamples 48kHz→8kHz
+- **D75CATClient** — TCP client to port 9750, polls radio state, auto-reconnects on connection loss
+- **TX_RADIO config** — Route playback/TTS/announcement PTT+audio to D75 instead of TH-9800
+- **D75 PTT** — `!ptt on`/`!ptt off` via CAT for software PTT (no RTS relay needed)
 - **Dashboard** — D75 audio level bar, connection status, mute control ('w' key)
+- **Automation engine** — Programmatic D75 tuning via FO command (freq/step/mode/tone/offset atomically)
 
 ### Connection modes in gateway:
-- **Bluetooth**: `!btstart` → D75AudioSource for audio
+- **Bluetooth**: `!btstart` → D75AudioSource for RX+TX audio, `!ptt on/off` for PTT
 - **USB**: `!serial connect` → audio via AIOC (existing radio source)
 
 ## TCP Protocol
@@ -150,13 +156,17 @@ Connect to port 9750. Commands use `!command [args]\n` format. Authenticate firs
 
 ## Audio Streaming
 
-When Bluetooth is configured (`bt_addr` is set), audio is available via:
+When Bluetooth is configured (`bt_addr` is set), audio is available via TCP port 9751.
 
-1. **TCP port 9751** — Connect and receive raw PCM (8kHz, 16-bit signed LE, mono)
+### RX Audio (Radio → Gateway)
+Clients connect and receive raw PCM (8kHz, 16-bit signed LE, mono). The server filters stuck SCO frames (dropped packets where the BT controller repeats the last sample), reducing artifacts from ~48% to ~4%.
 
-Audio format: 8,000 Hz sample rate, 16-bit signed little-endian, mono. 48-byte SCO frames (24 samples each, ~331 frames/sec). CVSD decoding is handled in hardware by the BT controller.
+### TX Audio (Gateway → Radio)
+The same TCP connection is **bidirectional**. When a client sends 8kHz PCM data TO the server, it is written directly to the SCO socket for radio transmission. This enables the gateway to transmit audio through the D75 over Bluetooth — playback files, TTS, and announcements are downsampled from 48kHz to 8kHz and sent over this path.
 
-The server filters stuck SCO frames (dropped packets where the BT controller repeats the last sample). These are replaced with faded copies of the last good frame, reducing artifacts from ~48% to ~4%.
+**TX audio chain:** Gateway playback (48kHz) → downsample to 8kHz (every 6th sample) → TCP port 9751 → D75_CAT.py → SCO write → D75 radio → over the air.
+
+Audio format: 8,000 Hz sample rate, 16-bit signed little-endian, mono. 48-byte SCO frames (24 samples each, ~331 frames/sec). CVSD decoding/encoding is handled in hardware by the BT controller.
 
 See [docs/bluetooth_audio.md](docs/bluetooth_audio.md) for full technical details including adapter selection, connection sequence, and troubleshooting.
 
@@ -211,9 +221,10 @@ Order matters: rfcomm bind to ch2 blocks the D75 from accepting ch1, so audio mu
 
 ## Known Issues
 
-- **D75 BT unresponsive after disconnect**: The D75 goes unresponsive after rapid BT connect/disconnect cycles. Toggle Bluetooth off/on on the radio to recover.
+- **D75 BT unresponsive after disconnect**: The D75 goes unresponsive after rapid BT connect/disconnect cycles or battery disconnect. Toggle Bluetooth off/on on the radio to recover.
 - **CSR SCO packet loss**: CSR adapters drop ~48% of SCO packets. The stuck frame filter handles this, but audio quality is limited to what SCO provides (~8kHz voice bandwidth).
 - **Realtek BT adapters**: Fatal SCO firmware bug. Do not use for audio.
+- **rfcomm bind before audio**: The `rfcomm bind` to channel 2 blocks the D75 from accepting RFCOMM channel 1. `run-headless.sh` skips the bind when `bt_addr` is set — `btstart` handles the correct order (audio first, then bind, then serial).
 
 ## License
 
