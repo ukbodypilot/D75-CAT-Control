@@ -300,6 +300,7 @@ class RadioState:
         self.backlight = 0
         self.bluetooth = False
         self.gps = [False, False]  # [enabled, pc_output]
+        self.battery_level = -1  # 0-3 (0=empty, 3=full), -1=unknown
         self.transmitting = False
         self.memory_mode = 0
         self.tnc = [0, 0]  # [mode, band]
@@ -327,6 +328,7 @@ class RadioState:
             'transmitting': self.transmitting,
             'tnc': self.tnc,
             'beacon_type': self.beacon_type,
+            'battery_level': self.battery_level,
         }
         for b in (0, 1):
             bd = dict(self.band[b])
@@ -783,6 +785,9 @@ class D75Serial:
             band = int(cmd_data[0])
             self.state.band[band]['power'] = int(cmd_data[1])
 
+        elif cmd == CAT.BatteryLevel and cmd_data:
+            self.state.battery_level = int(cmd_data[0])
+
         elif cmd == CAT.SquelchOpen and len(cmd_data) >= 2:
             band = int(cmd_data[0])
             if int(cmd_data[1]) == 0:
@@ -803,6 +808,7 @@ class D75Serial:
         await self.send_command(CAT.GPS)
         await self.send_command(CAT.TNC)
         await self.send_command(CAT.BeaconType)
+        await self.send_command(CAT.BatteryLevel)
 
         # Per-band queries
         for band in (0, 1):
@@ -1491,6 +1497,71 @@ class TCPServer:
                 return resp or 'no response'
             else:
                 return f"A:{self.serial.state.band[0]['channel']} B:{self.serial.state.band[1]['channel']}"
+
+        elif cmd == 'memlist':
+            # Read a single memory channel: !memlist <ch_num>
+            # Or scan a range: !memlist <start> <end>
+            # Returns JSON for programmed channels
+            if not self.serial.connected:
+                return 'serial not connected'
+            parts = data.split() if data else []
+            start = int(parts[0]) if parts else 0
+            end = int(parts[1]) if len(parts) > 1 else start
+            if start == end == 0 and not parts:
+                # Full scan: 0-999
+                end = 999
+
+            import json as _json
+            channels = []
+            _modes = {0: 'FM', 1: 'AM', 2: 'LSB', 3: 'USB', 4: 'CW', 5: 'DV'}
+            _shifts = {0: 'S', 1: '+', 2: '-'}
+            for ch_num in range(start, end + 1):
+                ch_str = str(ch_num).zfill(3)
+                resp = await self.serial.send_command(CAT.MemChannelFreq, ch_str)
+                if not resp or resp.strip() == 'N' or ',' not in str(resp):
+                    continue
+                line = str(resp).strip()
+                if line.startswith('ME '):
+                    line = line[3:]
+                fields = line.split(',')
+                if len(fields) < 14:
+                    continue
+                try:
+                    freq_hz = int(fields[1])
+                    if freq_hz < 1000000:
+                        continue
+                    freq = freq_hz / 1_000_000
+                    offset_hz = int(fields[2])
+                    offset = offset_hz / 1_000_000
+                    mode = int(fields[5])
+                    tone_on = fields[8] == '1'
+                    ctcss_on = fields[9] == '1'
+                    dcs_on = fields[10] == '1'
+                    shift = int(fields[13])
+                    tone_idx = int(fields[14]) if len(fields) > 14 else 0
+                    ctcss_idx = int(fields[15]) if len(fields) > 15 else 0
+                    tone_str = ''
+                    if ctcss_on and ctcss_idx < len(Constants.ctcss_tones):
+                        tone_str = Constants.ctcss_tones[ctcss_idx]
+                    elif tone_on and tone_idx < len(Constants.ctcss_tones):
+                        tone_str = Constants.ctcss_tones[tone_idx]
+                    elif dcs_on:
+                        dcs_idx = int(fields[16]) if len(fields) > 16 else 0
+                        if dcs_idx < len(Constants.dcs_tones):
+                            tone_str = 'D' + Constants.dcs_tones[dcs_idx]
+                    name = fields[20].strip() if len(fields) > 20 else ''
+                    channels.append({
+                        'ch': ch_str,
+                        'freq': round(freq, 4),
+                        'offset': round(offset, 4),
+                        'mode': _modes.get(mode, '?'),
+                        'shift': _shifts.get(shift, 'S'),
+                        'tone': tone_str,
+                        'name': name,
+                    })
+                except (ValueError, IndexError):
+                    continue
+            return _json.dumps(channels)
 
         elif cmd == 'tone':
             # !tone <band> <type> [freq/code]
