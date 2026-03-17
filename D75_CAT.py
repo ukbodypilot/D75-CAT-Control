@@ -2013,31 +2013,62 @@ async def main():
                 break
             await asyncio.sleep(0.1)
 
-        # Auto-connect: if BT configured, use btstart (handles audio→rfcomm→serial).
-        # If no BT, just connect serial directly.
-        async def _auto_connect():
-            await asyncio.sleep(1)  # Let TCP server finish binding
-            if bt_addr and audio:
-                print(f"[Startup] Running btstart (audio → rfcomm → serial)...", flush=True)
-                try:
-                    result = await tcp._process_cmd('btstart', '', None, True, 0)
-                    print(f"[Startup] btstart: {result}", flush=True)
-                except Exception as e:
-                    print(f"[Startup] btstart error: {e}", flush=True)
-            else:
-                print(f"[Startup] Connecting serial (no BT)...", flush=True)
-                try:
-                    ok = await d75.connect(comport, baudrate)
-                    print(f"[Startup] Serial: {'connected' if ok else 'failed'}", flush=True)
-                except Exception as e:
-                    print(f"[Startup] Serial connect error: {e}", flush=True)
-        asyncio.create_task(_auto_connect())
+        # Connection watchdog: monitors serial + audio, auto-reconnects via btstart.
+        # Runs every 10s. If either serial or audio drops, retries btstart with backoff.
+        _watchdog_running = True
+        _watchdog_failures = 0
+
+        async def _connection_watchdog():
+            nonlocal _watchdog_running, _watchdog_failures
+            await asyncio.sleep(2)  # Let TCP server finish binding
+
+            while _watchdog_running:
+                serial_ok = d75.connected
+                audio_ok = audio.connected if audio else True
+
+                if serial_ok and audio_ok:
+                    if _watchdog_failures > 0:
+                        print(f"[Watchdog] Connection restored (serial={serial_ok}, audio={audio_ok})", flush=True)
+                        _watchdog_failures = 0
+                    await asyncio.sleep(10)
+                    continue
+
+                # Something is down — attempt recovery
+                _watchdog_failures += 1
+                backoff = min(30, 5 * _watchdog_failures)
+                what = []
+                if not serial_ok:
+                    what.append('serial')
+                if not audio_ok:
+                    what.append('audio')
+                print(f"[Watchdog] {'+'.join(what)} down — recovery attempt {_watchdog_failures} (backoff {backoff}s)", flush=True)
+
+                if bt_addr and audio:
+                    try:
+                        result = await tcp._process_cmd('btstart', '', None, True, 0)
+                        print(f"[Watchdog] btstart: {result}", flush=True)
+                        if 'OK' in str(result):
+                            _watchdog_failures = 0
+                    except Exception as e:
+                        print(f"[Watchdog] btstart error: {e}", flush=True)
+                else:
+                    try:
+                        ok = await d75.connect(comport, baudrate)
+                        print(f"[Watchdog] Serial: {'connected' if ok else 'failed'}", flush=True)
+                        if ok:
+                            _watchdog_failures = 0
+                    except Exception as e:
+                        print(f"[Watchdog] Serial connect error: {e}", flush=True)
+
+                await asyncio.sleep(backoff)
+
+        watchdog_task = asyncio.create_task(_connection_watchdog())
 
         # SIGTERM handler for clean shutdown
         shutdown_event = asyncio.Event()
 
         def sigterm_handler(signum, frame):
-            print("\nShutdown signal received...")
+            print("\nShutdown signal received...", flush=True)
             shutdown_event.set()
 
         signal.signal(signal.SIGTERM, sigterm_handler)
@@ -2048,16 +2079,36 @@ async def main():
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:
-            print("Shutting down...")
-            if audio and audio.connected:
-                await audio.disconnect()
+            print("Shutting down...", flush=True)
+            # Stop watchdog first
+            _watchdog_running = False
+            watchdog_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(watchdog_task), timeout=2)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+
+            # Disconnect audio (with timeout — SCO close can hang)
+            if audio:
+                audio._running = False
+                try:
+                    await asyncio.wait_for(audio.disconnect(), timeout=3)
+                except (asyncio.TimeoutError, Exception) as e:
+                    print(f"  Audio disconnect timeout: {e}", flush=True)
+
+            # Disconnect serial (with timeout)
             if d75.connected:
                 if d75.transport:
                     try:
                         d75.transport.serial.dtr = False
                     except Exception:
                         pass
-                await d75.disconnect()
+                try:
+                    await asyncio.wait_for(d75.disconnect(), timeout=3)
+                except (asyncio.TimeoutError, Exception) as e:
+                    print(f"  Serial disconnect timeout: {e}", flush=True)
+
+            # Close TCP servers
             if audio_tcp:
                 audio_tcp._running = False
                 if audio_tcp._listen_sock:
@@ -2067,7 +2118,7 @@ async def main():
                         pass
             if tcp.server:
                 tcp.server.close()
-            print("Goodbye.")
+            print("Goodbye.", flush=True)
     else:
         print("Use --start-server to launch the TCP server")
         print("  Example: python3 D75_CAT.py -c /dev/ttyUSB0 --start-server")
