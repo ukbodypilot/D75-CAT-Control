@@ -4,7 +4,7 @@ description: D75 CAT + BT audio bidirectional, gateway integration, automation, 
 type: project
 ---
 
-**Status (2026-03-17):** Fully working. Bidirectional BT audio TX/RX. Connection watchdog with auto-recovery. Full web UI with memory channel scanner.
+**Status (2026-03-17):** Fully working. Bidirectional BT audio TX/RX. Connection watchdog with auto-recovery. Full web UI with memory channel scanner. Diagnostic status panel with self-service recovery.
 
 **Architecture:**
 - D75_CAT.py: headless TCP server, BT audio (SCO bidirectional), CAT serial (RFCOMM), connection watchdog
@@ -34,6 +34,15 @@ type: project
   - Cross-band detection (TX on different band = "Xband" in red)
 - Power: 0=High, 1=Med, 2=Low, 3=EL
 - Dual: DL 0=Dual, DL 1=Single
+- Diagnostic status panel (offline): 3-step checklist (service/TCP/serial) with recovery buttons
+  - Start Service: starts d75-cat systemd unit, auto-chains reconnect
+  - Reconnect: creates new D75CATClient TCP + restores audio source
+  - BT Start: reconnects then sends !btstart
+- d75-cat systemd service: enabled on boot (was disabled, caused post-reboot failure)
+- BT Stop button: graceful BT disconnect (serial→audio→rfcomm→HCI), pauses watchdog
+- BT Start resumes watchdog after intentional stop
+- Single/dual band display: single mode greys out inactive band (opacity 0.3, no pointer events)
+- Dual mode: red MAIN badge on active band (like TH-9800)
 
 **D75 ME (Memory) Format:**
 - 23 fields: ch_num, freq(10-digit Hz), tx_freq(10-digit Hz), step, tx_step, mode, ...

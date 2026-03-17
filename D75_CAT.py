@@ -1320,6 +1320,7 @@ class TCPServer:
         self.verbose = verbose
         self.server = None
         self.ready = False
+        self._watchdog_paused = False
 
     async def start(self, host='0.0.0.0', port=9750):
         self.server = await asyncio.start_server(
@@ -1942,6 +1943,8 @@ class TCPServer:
                 return 'usage: !audio connect|disconnect|status|flush|stream|stop'
 
         elif cmd == 'btstart':
+            # Resume watchdog (may have been paused by btstop)
+            self._watchdog_paused = False
             # Full Bluetooth startup: cleanup → audio+CKPD → bind rfcomm → serial
             # Audio (RFCOMM ch1 + SCO) must connect BEFORE rfcomm bind,
             # because rfcomm bind to ch2 blocks D75 from accepting ch1.
@@ -1999,6 +2002,41 @@ class TCPServer:
                     return f"btstart partial: {', '.join(steps)}"
 
             return f"btstart OK: {', '.join(steps)}"
+
+        elif cmd == 'btstop':
+            # Pause watchdog so it doesn't auto-reconnect after intentional disconnect
+            self._watchdog_paused = True
+            # Graceful Bluetooth shutdown: serial → audio → rfcomm release → hci disconnect
+            if not self.audio and not self.serial:
+                return 'nothing to disconnect'
+            bt = getattr(self.serial, '_bt_addr', '')
+            steps = []
+
+            # Step 1: Disconnect serial (closes /dev/rfcomm0)
+            if self.serial and self.serial.connected:
+                await self.serial.disconnect()
+                steps.append('serial')
+            await asyncio.sleep(0.3)
+
+            # Step 2: Disconnect audio (closes SCO socket)
+            if self.audio and self.audio.connected:
+                await self.audio.disconnect()
+                steps.append('audio')
+            await asyncio.sleep(0.3)
+
+            # Step 3: Release rfcomm binding
+            import subprocess
+            subprocess.run(['sudo', 'rfcomm', 'release', '0'],
+                           capture_output=True, timeout=5)
+            steps.append('rfcomm released')
+
+            # Step 4: HCI disconnect (clean BT link)
+            if bt:
+                subprocess.run(['sudo', 'hcitool', 'dc', bt],
+                               capture_output=True, timeout=5)
+                steps.append('hci disconnected')
+
+            return f"btstop OK: {', '.join(steps)}"
 
         else:
             return f"Unknown command: {cmd}"
@@ -2086,14 +2124,20 @@ async def main():
 
         # Connection watchdog: monitors serial + audio, auto-reconnects via btstart.
         # Runs every 10s. If either serial or audio drops, retries btstart with backoff.
+        # Paused by btstop (intentional disconnect), resumed by btstart.
         _watchdog_running = True
+        _watchdog_paused = False
         _watchdog_failures = 0
+        tcp._watchdog_paused = False  # Expose to _process_cmd
 
         async def _connection_watchdog():
             nonlocal _watchdog_running, _watchdog_failures
             await asyncio.sleep(2)  # Let TCP server finish binding
 
             while _watchdog_running:
+                if tcp._watchdog_paused:
+                    await asyncio.sleep(2)
+                    continue
                 serial_ok = d75.connected
                 audio_ok = audio.connected if audio else True
 
