@@ -878,9 +878,10 @@ class AudioManager:
     Result: 8kHz, 16-bit signed LE, mono PCM.
     """
 
-    def __init__(self, bt_addr, verbose=False):
+    def __init__(self, bt_addr, verbose=False, serial=None):
         self.bt_addr = bt_addr
         self.verbose = verbose
+        self._serial = serial  # D75Serial ref for S-meter squelch
         self._rfcomm = None
         self._sco = None
         self._running = False
@@ -1038,16 +1039,17 @@ class AudioManager:
     def _read_loop(self):
         """Continuously read SCO audio frames (runs in thread).
 
-        Filters out 'stuck' frames where the BT controller repeats the last
-        sample for all 24 positions (indicates a dropped SCO packet). These
-        frames are replaced with interpolated data from surrounding frames
-        to produce clean audio.
+        Uses the radio's S-meter (via D75Serial) to gate audio: when the
+        radio reports no signal (squelch closed), all SCO frames are replaced
+        with silence. This cleanly eliminates BT noise/crackle without any
+        RMS threshold tuning.
+
+        Also filters stuck frames (all-identical samples from dropped SCO packets).
         """
         if self.verbose:
             print("[Audio] Read loop started")
 
         import struct as _struct
-        _prev_frame = None  # Last good frame for interpolation
 
         while self._running and self._sco:
             try:
@@ -1057,23 +1059,18 @@ class AudioManager:
 
                 self._frame_count += 1
 
-                # Detect stuck frames: all samples identical (dropped SCO packet)
                 if len(data) == 48:
-                    samples = _struct.unpack('<24h', data)
-                    if len(set(samples)) <= 2:
-                        # Stuck frame — use last good frame faded toward zero,
-                        # or silence if no previous frame
-                        if _prev_frame is not None:
-                            # Fade previous frame by 50% toward zero
-                            prev_samples = _struct.unpack('<24h', _prev_frame)
-                            faded = _struct.pack('<24h', *(s // 2 for s in prev_samples))
-                            data = faded
-                            _prev_frame = faded
-                        else:
+                    # Check radio S-meter — zero audio when squelch is closed
+                    if self._serial and hasattr(self._serial, 'state'):
+                        ab = self._serial.state.active_band
+                        s_meter = self._serial.state.band.get(ab, {}).get('s_meter', 0)
+                        if s_meter == 0:
                             data = b'\x00' * 48
-                        # Don't update _prev_frame with stuck data
                     else:
-                        _prev_frame = data
+                        # No serial ref — fall back to stuck frame detection only
+                        samples = _struct.unpack('<24h', data)
+                        if len(set(samples)) <= 2:
+                            data = b'\x00' * 48
 
                 # Buffer for polling reads
                 with self._buf_lock:
@@ -2106,7 +2103,7 @@ async def main():
         audio = None
         audio_tcp = None
         if bt_addr:
-            audio = AudioManager(bt_addr, verbose=verbose)
+            audio = AudioManager(bt_addr, verbose=verbose, serial=d75)
             audio_tcp = AudioTCPServer(audio, verbose=verbose)
 
         # Create TCP server
@@ -2181,6 +2178,19 @@ async def main():
                 await asyncio.sleep(backoff)
 
         watchdog_task = asyncio.create_task(_connection_watchdog())
+
+        # S-meter polling task — updates s_meter state for audio squelch gating
+        async def _smeter_poll():
+            while True:
+                if d75.connected:
+                    try:
+                        for b in (0, 1):
+                            await d75.send_command(CAT.S_Meter, str(b))
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.5)  # Poll every 500ms
+
+        smeter_task = asyncio.create_task(_smeter_poll())
 
         # SIGTERM handler for clean shutdown
         shutdown_event = asyncio.Event()
