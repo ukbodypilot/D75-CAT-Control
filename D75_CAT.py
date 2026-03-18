@@ -1898,6 +1898,9 @@ class TCPServer:
 
         elif cmd == 'status':
             state = self.serial.state.to_dict()
+            # Clear model_id when serial is disconnected so clients know radio is unreachable
+            if not self.serial.connected:
+                state['model_id'] = ''
             if self.audio:
                 state['audio'] = self.audio.to_dict()
             return json.dumps(state)
