@@ -140,6 +140,70 @@ timeouts of at least 15 seconds to avoid false failures.
 | Concurrent users | N/A | Single RFCOMM client |
 | Range | Cable length | ~10m typical |
 
+## ME vs FO Field Mapping (Memory Read vs Frequency Options)
+
+The TH-D75's `ME` (Memory Read) and `FO` (Frequency Options) commands share a similar field layout but **ME has two extra fields** that FO does not:
+
+### FO Format (21 fields)
+
+```
+FO band,rxfreq,offset,rxstep,txstep,mode,fine_mode,fine_step,
+   tone,ctcss,dcs,cross,reverse,shift,
+   tone_idx,ctcss_idx,dcs_idx,cross_type,urcall,dsql_type,dsql_code
+```
+
+### ME Format (23 fields)
+
+```
+ME ch,rxfreq,txfreq_or_offset,rxstep,txstep,mode,fine_mode,fine_step,
+   tone,ctcss,dcs,cross,reverse,shift,
+   lockout,                                    ← extra field (not in FO)
+   tone_idx,ctcss_idx,dcs_idx,cross_type,urcall,dsql_type,dsql_code,
+   name_or_flags                               ← extra field (not in FO)
+```
+
+### Key Differences
+
+| Index | ME field | FO field | Notes |
+|-------|----------|----------|-------|
+| [0] | Channel number | Band (0/1) | Different meaning |
+| [2] | TX freq or offset | Offset only | See below |
+| [14] | **Lockout** | tone_idx | ME-only field — shifts all subsequent indices |
+| [22] | Name/flags | *(none)* | ME-only trailing field |
+
+### ME Field [2]: Dual Meaning
+
+ME field [2] stores different values depending on the channel type:
+
+- **Small value (< 100 MHz):** Already an offset in Hz (e.g., `0000600000` = 600 kHz)
+- **Large value (≥ 100 MHz):** Full TX frequency in Hz (e.g., `0437450000` = 437.45 MHz for cross-band)
+
+FO field [2] always stores the offset. When constructing an FO SET command from ME data, convert large TX frequencies to offsets: `offset = abs(TX_freq - RX_freq)`.
+
+### Converting ME → FO for Channel Load
+
+To load a memory channel into VFO using FO SET:
+
+```python
+me_fields = me_response.split(',')  # 23 fields
+# Skip ME[0] (channel) and ME[14] (lockout)
+fo_data = me_fields[1:14] + me_fields[15:22]  # 20 fields
+# Convert field[2] (TX freq) to offset if needed
+field2 = int(fo_data[1])
+rx_hz = int(fo_data[0])
+if field2 >= 100_000_000:  # TX frequency, not offset
+    fo_data[1] = str(abs(field2 - rx_hz)).zfill(10)
+    # Set shift from TX/RX relationship
+    if field2 > rx_hz:
+        fo_data[12] = '1'  # +
+    elif field2 < rx_hz:
+        fo_data[12] = '2'  # -
+# Send FO: band + 20 data fields = 21 total
+fo_cmd = f"FO {band}," + ",".join(fo_data)
+```
+
+**Critical:** Copying ME fields directly into FO without skipping the lockout field shifts tone_idx, ctcss_idx, and all subsequent fields by one position. The radio silently rejects the malformed FO command with no error response.
+
 ## References
 
 - Kenwood TH-D75 CAT command reference (via Hamlib `thd74.c`)
