@@ -205,7 +205,10 @@ journalctl -u d75-cat -f              # Follow logs
 | `bt_full_test.py` | Integration test — CAT + audio simultaneous |
 | `bt_audio_test.py` | Basic SCO audio capture test |
 | `bt_dual_test.py` | CAT + audio dual test |
+| `remote_bt_proxy.py` | Standalone remote BT proxy — no D75_CAT.py dependency |
 | `docs/bluetooth_audio.md` | Full BT audio technical reference |
+| `docs/cat_over_bluetooth.md` | CAT command rate limits and BT link stability |
+| `docs/remote_proxy.md` | Remote proxy architecture and deployment |
 | `d75_cat_control.py` | Original GUI application (upstream, not used) |
 | `CATControlServer.py` | Original GUI server (upstream, not used) |
 
@@ -219,12 +222,29 @@ The `!btstart` command executes this sequence:
 
 Order matters: rfcomm bind to ch2 blocks the D75 from accepting ch1, so audio must connect first. CKPD must be sent after SCO but before serial opens.
 
+## Remote Bluetooth Proxy
+
+When the gateway runs on a different machine from the Bluetooth adapter, use `remote_bt_proxy.py` as a lightweight bridge. It implements the same TCP protocol as `D75_CAT.py` but uses raw Bluetooth sockets instead of rfcomm bind — no systemd service or pyserial-asyncio required.
+
+```bash
+# On the machine near the radio (edit D75_MAC in the script first):
+python3 remote_bt_proxy.py
+
+# Gateway config:
+D75_HOST = <proxy-machine-ip>
+D75_PORT = 9750
+D75_AUDIO_PORT = 9751
+```
+
+See [docs/remote_proxy.md](docs/remote_proxy.md) for architecture details and [docs/cat_over_bluetooth.md](docs/cat_over_bluetooth.md) for BT-specific rate limits that affect reliability.
+
 ## Known Issues
 
 - **D75 BT unresponsive after disconnect**: The D75 goes unresponsive after rapid BT connect/disconnect cycles or battery disconnect. Toggle Bluetooth off/on on the radio to recover.
 - **CSR SCO packet loss**: CSR adapters drop ~48% of SCO packets. The stuck frame filter handles this, but audio quality is limited to what SCO provides (~8kHz voice bandwidth).
 - **Realtek BT adapters**: Fatal SCO firmware bug. Do not use for audio.
 - **rfcomm bind before audio**: The `rfcomm bind` to channel 2 blocks the D75 from accepting RFCOMM channel 1. `run-headless.sh` skips the bind when `bt_addr` is set — `btstart` handles the correct order (audio first, then bind, then serial).
+- **S-meter polling kills BT link**: Polling `SM` faster than every 3 seconds over Bluetooth saturates RFCOMM, causes cascading timeouts, and eventually drops the connection. See [docs/cat_over_bluetooth.md](docs/cat_over_bluetooth.md).
 
 ## License
 
