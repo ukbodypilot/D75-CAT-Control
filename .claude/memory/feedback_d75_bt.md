@@ -19,6 +19,8 @@ Correct BT startup order (!btstart):
 2. Bind rfcomm0 (rfcomm bind to ch2 blocks D75 from accepting ch1)
 3. Open serial on /dev/rfcomm0
 
+**Watchdog auto-reconnect must do the CKPD dance too** (radio-gateway commit 8c10ca3, 2026-05-19). `D75Plugin._bt_connect()` in `tools/d75_link_plugin.py` opens serial first, then audio with `send_ckpd=False` (CKPD can't go through while CAT is open on ch2 — cross-channel issue). After audio is up it MUST: disconnect serial → `audio.send_ckpd()` → sleep → reconnect serial. Without the dance, SCO is up at the OS level but the D75 silently discards TX audio — PTT keys the radio briefly with no modulation (no red light, no RF). Symptom was undetectable for hours until the user actually tried to TX.
+
 Audio TCP streaming uses raw sockets, not asyncio StreamWriter. asyncio writer.write() via call_soon_threadsafe never reliably flushed.
 
 D75CATClient in gateway: send_command() pauses polling thread to avoid race condition where poll response gets returned instead of command response. Buffer is flushed before each command.
